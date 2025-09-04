@@ -44,17 +44,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_FORWARD, 2) pos_mlp_bias_for
     const float i = ((float) (spatial_idx / W)) / (float) (H-1);
     const float j = ((float) (spatial_idx % W)) / (float) (W-1);
 
-    const float x1 = pos[b * 4 + 0];
-    const float y1 = pos[b * 4 + 1];
-    const float x2 = pos[b * 4 + 2];
-    const float y2 = pos[b * 4 + 3];
-
-    const float cx = (x1 + x2) * 0.5f;
-    const float cy = (y1 + y2) * 0.5f;
-    float half_w = (x2 - x1) * 0.5f;
-    float half_h = (y2 - y1) * 0.5f;
-    half_w = fmaxf(half_w, 1e-6f);
-    half_h = fmaxf(half_h, 1e-6f);
+    const float cx = pos[b * 4 + 0];
+    const float cy = pos[b * 4 + 1];
+    const float half_w = fmaxf(pos[b * 4 + 2] * 0.5f, 1e-6f);
+    const float half_h = fmaxf(pos[b * 4 + 3] * 0.5f, 1e-6f);
 
     const float rel_x = (j - cx) / half_w;
     const float rel_y = (i - cy) / half_h;
@@ -146,17 +139,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) pos_mlp_bias_backward_ke
     }
     __syncthreads();
 
-    float x1 = pos[b * 4 + 0];
-    float y1 = pos[b * 4 + 1];
-    float x2 = pos[b * 4 + 2];
-    float y2 = pos[b * 4 + 3];
-
-    float cx = (x1 + x2) * 0.5f;
-    float cy = (y1 + y2) * 0.5f;
-    float half_w = (x2 - x1) * 0.5f;
-    float half_h = (y2 - y1) * 0.5f;
-    half_w = fmaxf(half_w, 1e-6f);
-    half_h = fmaxf(half_h, 1e-6f);
+    const float cx = pos[b * 4 + 0];
+    const float cy = pos[b * 4 + 1];
+    const float half_w = fmaxf(pos[b * 4 + 2] * 0.5f, 1e-6f);
+    const float half_h = fmaxf(pos[b * 4 + 3] * 0.5f, 1e-6f);
 
     const float* w = &mlp_weights[b * grad_size];
     const float* grad_out_b = &grad_output[b * H * W];
@@ -244,15 +230,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 4) pos_mlp_bias_backward_ke
     }
     __syncthreads();
 
-    float x1 = pos[b * 4 + 0];
-    float y1 = pos[b * 4 + 1];
-    float x2 = pos[b * 4 + 2];
-    float y2 = pos[b * 4 + 3];
-
-    float cx = (x1 + x2) * 0.5f;
-    float cy = (y1 + y2) * 0.5f;
-    float half_w = fmaxf((x2 - x1) * 0.5f, 1e-6f);
-    float half_h = fmaxf((y2 - y1) * 0.5f, 1e-6f);
+    const float cx = pos[b * 4 + 0];
+    const float cy = pos[b * 4 + 1];
+    const float half_w = fmaxf(pos[b * 4 + 2] * 0.5f, 1e-6f);
+    const float half_h = fmaxf(pos[b * 4 + 3] * 0.5f, 1e-6f);
 
     //const float* w = &mlp_weights[b * grad_size];
     const float* w = s_grad;

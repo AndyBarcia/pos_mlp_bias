@@ -15,9 +15,11 @@ except ImportError:
 
 class PosMLPBiasCUDAFunction(Function):
     @staticmethod
-    def forward(ctx, mlp_weights, pos, c_hidden, W, H):
+    def forward(ctx, mlp_weights, pos, c_hidden, H, W):
         ctx.save_for_backward(mlp_weights, pos)
         ctx.c_hidden = c_hidden
+        mlp_weights = mlp_weights.contiguous()
+        pos = pos.contiguous()
         output = pos_mlp_bias.forward(mlp_weights, pos, c_hidden, H, W)
         return output
 
@@ -44,11 +46,9 @@ def pos_mlp_bias_python(mlp_weights, pos, c_hidden, W, H) -> torch.Tensor:
     assert C2 == 4 * C + 1
 
     # Extract boxes
-    x1, y1, x2, y2 = pos[:, 0], pos[:, 1], pos[:, 2], pos[:, 3]
-    cx = (x1 + x2) / 2
-    cy = (y1 + y2) / 2
-    half_w = (x2 - x1) / 2
-    half_h = (y2 - y1) / 2
+    cx, cy, w, h = pos[:, 0], pos[:, 1], pos[:, 2], pos[:, 3]
+    half_w = w / 2
+    half_h = h / 2
 
     # Avoid 0 division
     epsilon = 1e-6
