@@ -116,90 +116,7 @@ torch::Tensor fused_attn_forward(
     return output;
 }
 
-
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) pos_mlp_bias_backward_kernel(
-    const float* __restrict__ mlp_weights,
-    const float* __restrict__ pos,
-    const float* __restrict__ grad_output,
-    int c_hidden,
-    int W,
-    int H,
-    int B,
-    float* __restrict__ grad_weights
-) {
-
-    int b = blockIdx.x;
-    int tid = threadIdx.x;
-
-    extern __shared__ float s_grad[];
-    int grad_size = 4 * c_hidden + 1;
-
-    if (tid < grad_size) {
-        s_grad[tid] = 0.0f;
-    }
-    __syncthreads();
-
-    const float cx = pos[b * 4 + 0];
-    const float cy = pos[b * 4 + 1];
-    const float half_w = fmaxf(pos[b * 4 + 2] * 0.5f, 1e-6f);
-    const float half_h = fmaxf(pos[b * 4 + 3] * 0.5f, 1e-6f);
-
-    const float* w = &mlp_weights[b * grad_size];
-    const float* grad_out_b = &grad_output[b * H * W];
-
-    for (int idx = tid; idx < H * W; idx += blockDim.x) {
-        int i = idx / W;
-        int j = idx % W;
-
-        float rel_x = ((((float)j)/(float)(W-1)) - cx) / half_w;
-        float rel_y = ((((float)i)/(float)(H-1)) - cy) / half_h;
-
-        float x[MAX_C];
-        float max_x = -FLT_MAX;
-        for (int k = 0; k < c_hidden; k++) {
-            x[k] = rel_x * w[2 * k] + rel_y * w[2 * k + 1] + w[2 * c_hidden + k];
-            if (x[k] > max_x) max_x = x[k];
-        }
-
-        float s[MAX_C];
-        float sum_exp = 0.0f;
-        for (int k = 0; k < c_hidden; k++) {
-            s[k] = __expf(x[k] - max_x);
-            sum_exp += s[k];
-        }
-        float inv_sum = 1.0f / sum_exp;
-        for (int k = 0; k < c_hidden; k++) {
-            s[k] *= inv_sum;
-        }
-
-        float dL_doutput_bij = grad_out_b[i * W + j];
-
-        float output_minus_b2 = 0.0f;
-        for (int k = 0; k < c_hidden; k++) {
-            output_minus_b2 += s[k] * w[3 * c_hidden + k];
-        }
-
-        atomicAdd(&s_grad[4 * c_hidden], dL_doutput_bij);
-
-        for (int k = 0; k < c_hidden; k++) {
-            atomicAdd(&s_grad[3 * c_hidden + k], dL_doutput_bij * s[k]);
-
-            float dL_dx_k = s[k] * (dL_doutput_bij * w[3 * c_hidden + k] - dL_doutput_bij * output_minus_b2);
-
-            atomicAdd(&s_grad[2 * k], dL_dx_k * rel_x);
-            atomicAdd(&s_grad[2 * k + 1], dL_dx_k * rel_y);
-            atomicAdd(&s_grad[2 * c_hidden + k], dL_dx_k);
-        }
-    }
-
-    __syncthreads();
-
-    if (tid < grad_size) {
-        grad_weights[b * grad_size + tid] = s_grad[tid];
-    }
-}
-
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, 4) pos_mlp_bias_backward_kernel_optimized(
+__global__ void __launch_bounds__(THREADS_PER_BLOCK, 4) pos_mlp_bias_backward_kernel(
     const float* __restrict__ mlp_weights,
     const float* __restrict__ pos,
     const float* __restrict__ grad_output,
@@ -334,7 +251,7 @@ torch::Tensor fused_attn_backward(
     int grad_size = 4 * c_hidden + 1;
     size_t shared_mem_size = grad_size * sizeof(float);
 
-    pos_mlp_bias_backward_kernel_optimized<<<B, THREADS_PER_BLOCK, shared_mem_size>>>(
+    pos_mlp_bias_backward_kernel<<<B, THREADS_PER_BLOCK, shared_mem_size>>>(
         mlp_weights.data_ptr<float>(),
         pos.data_ptr<float>(),
         grad_out.data_ptr<float>(),

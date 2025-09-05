@@ -3,6 +3,6 @@ sudo -E "PATH=$PATH" "PYTHONPATH=$PYTHONPATH" \
     -o report_backward \
     --target-processes all \
     --set full \
-    -k pos_mlp_bias_backward_kernel_optimized \
+    -k pos_mlp_bias_backward_kernel \
     -f python3 test.py
 
