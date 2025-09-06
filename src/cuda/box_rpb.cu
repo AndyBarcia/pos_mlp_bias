@@ -36,7 +36,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_FORWARD, 2) box_rbp_forward_
     const float rel_x = (j - cx) / half_w;
     const float rel_y = (i - cy) / half_h;
 
-    // Weights are now shared across the batch, so no batch offset is needed.
     const float* w = mlp_weights;
 
     float temp[C_HIDDEN];
@@ -131,7 +130,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 4) box_rbp_backward_kernel(
 
     // s_mem will be used for both weights and gradients
     float* s_weights = s_mem;
-    float* s_grad = s_mem;
+    float* s_grad = s_mem + grad_size;
 
     // Use a private, register-based array for gradient accumulation.
     float p_grad[4 * C_HIDDEN + 1];
@@ -142,6 +141,11 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 4) box_rbp_backward_kernel(
     // Cooperatively load the shared mlp_weights into shared memory.
     if (tid < grad_size) {
         s_weights[tid] = mlp_weights[tid];
+    }
+
+    // 0-initialize shared memory for gradients
+    if (tid < grad_size) {
+        s_grad[tid] = 0.0f;
     }
     __syncthreads();
 
@@ -199,13 +203,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 4) box_rbp_backward_kernel(
 
     __syncthreads();
 
-    // Re-Initialize shared memory for reduction.
-    if (tid < grad_size) {
-        s_grad[tid] = 0.0f;
-    }
-
-    __syncthreads();
-
     // Reduce private gradients (p_grad) into shared memory (s_grad).
     for (int i = 0; i < grad_size; ++i) {
         float val = p_grad[i];
@@ -243,7 +240,7 @@ torch::Tensor fused_box_rpb_backward(
     // zeros_like correctly creates a tensor with the same shape as mlp_weights (no batch dim).
     auto grad_weights = torch::zeros_like(mlp_weights);
     int grad_size = 4 * c_hidden + 1;
-    size_t shared_mem_size = grad_size * sizeof(float);
+    size_t shared_mem_size = 2 * grad_size * sizeof(float);
 
     // Templated kernel launcher
     auto launch_kernel = [&](auto... Dims) {

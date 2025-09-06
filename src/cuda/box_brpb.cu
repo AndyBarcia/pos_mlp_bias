@@ -125,8 +125,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 4) pos_mlp_bias_backward_ke
     int b = blockIdx.x;
     int tid = threadIdx.x;
 
-    extern __shared__ float s_grad[];
+    extern __shared__ float s_mem[];
     int grad_size = 4 * C_HIDDEN + 1;
+
+    // Use shared memory for weights and for gradient reduction
+    float* s_weights = s_mem;
+    float* s_grad = s_mem + grad_size;
 
     // Use a private, register-based array for gradient accumulation.
     // Initialize it to zero.
@@ -138,7 +142,12 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 4) pos_mlp_bias_backward_ke
     // Cooperatively load mlp_weights into shared memory.
     // This access is fully coalesced.
     if (tid < grad_size) {
-        s_grad[tid] = mlp_weights[b * grad_size + tid];
+        s_weights[tid] = mlp_weights[b * grad_size + tid];
+    }
+
+    // 0-initialize shared memory for gradients
+    if (tid < grad_size) {
+        s_grad[tid] = 0.0f;
     }
     __syncthreads();
 
@@ -147,7 +156,6 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 4) pos_mlp_bias_backward_ke
     const float half_w = fmaxf(pos[b * 4 + 2] * 0.5f, 1e-6f);
     const float half_h = fmaxf(pos[b * 4 + 3] * 0.5f, 1e-6f);
 
-    const float* w = s_grad;
     const float* grad_out_b = &grad_output[b * HEIGHT * WIDTH];
 
     for (int idx = tid; idx < HEIGHT * WIDTH; idx += blockDim.x) {
@@ -162,7 +170,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 4) pos_mlp_bias_backward_ke
 
         float max_x = -FLT_MAX;
         for (int k = 0; k < C_HIDDEN; k++) {
-            x[k] = rel_x * w[2 * k] + rel_y * w[2 * k + 1] + w[2 * C_HIDDEN + k];
+            x[k] = rel_x * s_weights[2 * k] + rel_y * s_weights[2 * k + 1] + s_weights[2 * C_HIDDEN + k];
             if (x[k] > max_x) max_x = x[k];
         }
 
@@ -181,24 +189,17 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 4) pos_mlp_bias_backward_ke
 
         float output_minus_b2 = 0.0f;
         for (int k = 0; k < C_HIDDEN; k++) {
-            output_minus_b2 += s[k] * w[3 * C_HIDDEN + k];
+            output_minus_b2 += s[k] * s_weights[3 * C_HIDDEN + k];
         }
 
         p_grad[4 * C_HIDDEN] += dL_doutput_bij;
         for (int k = 0; k < C_HIDDEN; k++) {
             p_grad[3 * C_HIDDEN + k] += dL_doutput_bij * s[k];
-            float dL_dx_k = s[k] * (dL_doutput_bij * w[3 * C_HIDDEN + k] - dL_doutput_bij * output_minus_b2);
+            float dL_dx_k = s[k] * (dL_doutput_bij * s_weights[3 * C_HIDDEN + k] - dL_doutput_bij * output_minus_b2);
             p_grad[2 * k] += dL_dx_k * rel_x;
             p_grad[2 * k + 1] += dL_dx_k * rel_y;
             p_grad[2 * C_HIDDEN + k] += dL_dx_k;
         }
-    }
-
-    __syncthreads();
-
-    // Re-Initialize shared memory in parallel for reduction.
-    if (tid < grad_size) {
-        s_grad[tid] = 0.0f;
     }
 
     __syncthreads();
@@ -243,7 +244,7 @@ torch::Tensor fused_box_brpb_backward(
 
     auto grad_weights = torch::zeros_like(mlp_weights);
     int grad_size = 4 * c_hidden + 1;
-    size_t shared_mem_size = grad_size * sizeof(float);
+    size_t shared_mem_size = 2 * grad_size * sizeof(float);
 
     // Templated kernel launcher
     auto launch_kernel = [&](auto... Dims) {
