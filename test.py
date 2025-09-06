@@ -5,7 +5,7 @@ import copy
 import gc
 import psutil
 import os
-from functions import PosMLPBiasCUDAFunction, pos_mlp_bias_python
+from functions import BoxBRPBCUDAFunction, box_brbp_python
 
 def get_memory_info():
     """Get current memory usage information"""
@@ -82,7 +82,7 @@ def run_test():
         with_stack=True
     ) as prof:
         with record_function("pytorch_forward"):
-            output_py = pos_mlp_bias_python(mlp_weights_py, pos, Ch, W, H)
+            output_py = box_brbp_python(mlp_weights_py, pos, Ch, W, H)
             torch.cuda.synchronize()
 
     print("PYTORCH FORWARD PROFILER RESULTS:")
@@ -120,7 +120,7 @@ def run_test():
         with_stack=True
     ) as prof_cuda:
         with record_function("cuda_forward"):
-            output_cu = PosMLPBiasCUDAFunction.apply(mlp_weights_cu, pos, Ch, W, H)
+            output_cu = BoxBRPBCUDAFunction.apply(mlp_weights_cu, pos, Ch, W, H)
             torch.cuda.synchronize()
     
     print("CUDA FORWARD PROFILER RESULTS:")

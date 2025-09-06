@@ -13,25 +13,25 @@ except ImportError:
     print("Run: pip3 install --no-build-isolation .")
 
 
-class PosMLPBiasCUDAFunction(Function):
+class BoxBRPBCUDAFunction(Function):
     @staticmethod
     def forward(ctx, mlp_weights, pos, c_hidden, H, W):
         ctx.save_for_backward(mlp_weights, pos)
         ctx.c_hidden = c_hidden
         mlp_weights = mlp_weights.contiguous()
         pos = pos.contiguous()
-        output = pos_mlp_bias.forward(mlp_weights, pos, c_hidden, H, W)
+        output = pos_mlp_bias.forward_brpb(mlp_weights, pos, c_hidden, H, W)
         return output
 
     @staticmethod
     def backward(ctx, grad_output):
         mlp_weights, pos = ctx.saved_tensors
         grad_output = grad_output.contiguous()
-        grad_weights = pos_mlp_bias.backward(grad_output, mlp_weights, pos, ctx.c_hidden)
+        grad_weights = pos_mlp_bias.backward_brpb(grad_output, mlp_weights, pos, ctx.c_hidden)
         return grad_weights, None, None, None, None
 
 
-def pos_mlp_bias_python(mlp_weights, pos, c_hidden, W, H) -> torch.Tensor:
+def box_brbp_python(mlp_weights, pos, c_hidden, W, H) -> torch.Tensor:
     """
     Python reference implementation for the MLP position bias kernel.
     mlp_weights: (B, [2*C' + C' + 1*C' + 1])

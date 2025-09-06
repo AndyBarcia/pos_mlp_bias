@@ -1,10 +1,11 @@
 import torch
 import torch.nn.functional as F
 
-from typing import Union, Tuple
+from typing import Union, Tuple, Optional
 from einops import pack
 
-from .pos_mlp_function import PosMLPBiasCUDAFunction, pos_mlp_bias_python
+from .box_rpb_function import BoxRPBCUDAFunction, box_rbp_python
+from .box_brpb_function import BoxBRPBCUDAFunction, box_brbp_python
 
 
 class PosMLP(torch.nn.Module):
@@ -15,6 +16,7 @@ class PosMLP(torch.nn.Module):
         self, 
         dim,
         hidden_dim=16,
+        batched: bool = True,
         implementation: str = "cuda"
     ):
         super().__init__()
@@ -22,14 +24,18 @@ class PosMLP(torch.nn.Module):
         self.hidden_dim = hidden_dim
         assert implementation in ["python", "cuda"]
         self.implementation = implementation
+        self.batched = batched
 
-        self.weight_generator = torch.nn.Linear(dim, 4 * hidden_dim + 1)
+        if self.batched:
+            self.weight_generator = torch.nn.Linear(dim, 4 * hidden_dim + 1)
+        else:
+            self.weights = torch.nn.Parameter(torch.randn(4 * hidden_dim + 1))
 
     def forward(
         self,
-        queries: torch.Tensor, # (...,C)
         pos: torch.Tensor, # (...,[x,y,w,h])
         size: Union[int, Tuple[int, int]], # (H,W) or int for square
+        queries: Optional[torch.Tensor] = None, # (...,C)
         implementation: str = "cuda"
     ) -> torch.Tensor: # (...,H,W)
         queries, queries_ps = pack([queries], "* c")
@@ -38,12 +44,19 @@ class PosMLP(torch.nn.Module):
         implementation_to_use = self.implementation if implementation is None else implementation
         size = (size, size) if isinstance(size, int) else size
 
-        weights = self.weight_generator(queries) # (..., 4*hidden_dim + 1)
-
-        if implementation_to_use == "cuda":
-            output = PosMLPBiasCUDAFunction.apply(weights, pos, self.hidden_dim, size[0], size[1])
-        elif implementation_to_use == "python":
-            output = pos_mlp_bias_python(weights, pos, self.hidden_dim, size[0], size[1])
+        if self.batched:
+            assert queries is not None, "Queries must be provided for batched mode."
+            weights = self.weight_generator(queries) # (..., 4*hidden_dim + 1)
+            if implementation_to_use == "cuda":
+                output = BoxBRPBCUDAFunction.apply(weights, pos, self.hidden_dim, size[0], size[1])
+            elif implementation_to_use == "python":
+                output = box_brbp_python(weights, pos, self.hidden_dim, size[0], size[1])
+        else:
+            weights = self.weights # (4*hidden_dim + 1)
+            if implementation_to_use == "cuda":
+                output = BoxRPBCUDAFunction.apply(weights, pos, self.hidden_dim, size[0], size[1])
+            elif implementation_to_use == "python":
+                output = box_rbp_python(weights, pos, self.hidden_dim, size[0], size[1])
         
         final_shape = queries_ps[0] + (size[0], size[1])
         return output.view(final_shape)
@@ -59,6 +72,7 @@ class PosMLPAttention(torch.nn.Module):
         k_dim=None,
         hidden_dim=16,
         n_heads=8,
+        batched_rpb: bool = True,
         implementation: str = "cuda"
     ):
         super().__init__()
@@ -67,7 +81,7 @@ class PosMLPAttention(torch.nn.Module):
         self.head_dim = dim // n_heads
         assert dim % n_heads == 0, f"dim ({dim}) must be divisible by n_heads ({n_heads})"
 
-        self.pos_mlp = PosMLP(dim, hidden_dim, implementation)
+        self.pos_mlp = PosMLP(dim, hidden_dim, batched_rpb, implementation)
 
         # Linear projections for Q, K, V
         self.q_proj = torch.nn.Linear(dim, dim, bias=False)
@@ -114,7 +128,7 @@ class PosMLPAttention(torch.nn.Module):
         attention = attention.view(batch_size, self.n_heads, H, W)  # (B, n_heads, H, W)
         
         # Add positional bias
-        pos_bias = self.pos_mlp(queries, pos, (H, W))  # (B, H, W)
+        pos_bias = self.pos_mlp(pos, (H, W), queries)  # (B, H, W)
         pos_bias = pos_bias.unsqueeze(1).expand(-1, self.n_heads, -1, -1)  # (B, n_heads, H, W)
         attention = attention + pos_bias
         

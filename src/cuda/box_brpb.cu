@@ -85,7 +85,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_FORWARD, 2) pos_mlp_bias_for
     output[tid] = out_val;
 }
 
-torch::Tensor fused_attn_forward(
+torch::Tensor fused_box_brpb_forward(
     const torch::Tensor& mlp_weights, // (B, [2*C' + C' + 1*C' + 1])
     const torch::Tensor& pos,    // (B,[x,y,w,h])
     const int c_hidden,
@@ -233,7 +233,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 4) pos_mlp_bias_backward_ke
     }
 }
 
-torch::Tensor fused_attn_backward(
+torch::Tensor fused_box_brpb_backward(
     const torch::Tensor& grad_out, // (B, H, W)
     const torch::Tensor& mlp_weights, // (B, [2*C' + C' + 1*C' + 1])
     const torch::Tensor& pos,    // (B,[x,y,w,h])
@@ -265,9 +265,4 @@ torch::Tensor fused_attn_backward(
     CHECK_CUDA_ERROR(cudaPeekAtLastError());
 
     return grad_weights;
-}
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &fused_attn_forward, "Fused Attention Forward (Multi-Head)");
-    m.def("backward", &fused_attn_backward, "Fused Attention Backward (Multi-Head)");
 }
