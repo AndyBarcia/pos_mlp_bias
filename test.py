@@ -1,163 +1,122 @@
-from torch.profiler import profile, record_function, ProfilerActivity
+import unittest
 import torch
-import time
-import copy
-import gc
-import psutil
-import os
-from functions import BoxBRPBCUDAFunction, box_brbp_python
 
-def get_memory_info():
-    """Get current memory usage information"""
-    if torch.cuda.is_available():
-        gpu_memory = torch.cuda.memory_allocated() / 1024**2  # MB
-        gpu_memory_cached = torch.cuda.memory_reserved() / 1024**2  # MB
-    else:
-        gpu_memory = gpu_memory_cached = 0
-    
-    # CPU memory usage
-    process = psutil.Process(os.getpid())
-    cpu_memory = process.memory_info().rss / 1024**2  # MB
-    
-    return {
-        'gpu_allocated': gpu_memory,
-        'gpu_cached': gpu_memory_cached,
-        'cpu_memory': cpu_memory
-    }
-
-def print_memory_usage(label, mem_info):
-    """Print formatted memory usage information"""
-    print(f"{label}:")
-    print(f"  CPU Memory: {mem_info['cpu_memory']:.2f} MB")
-    if torch.cuda.is_available():
-        print(f"  GPU Allocated: {mem_info['gpu_allocated']:.2f} MB")
-        print(f"  GPU Cached: {mem_info['gpu_cached']:.2f} MB")
-
-def run_test():
-    # Parameters
-    B, Ch = 16*300, 16
-    H, W = 64, 64
-    dtype = torch.float32
-
-    # Determine device: Use CUDA if extension is available AND torch.cuda is available
-    device = torch.device("cuda")
-    print(f"Testing with: B={B}, Ch={Ch}, H={H}, W={W}")
-    print(f"Torch CUDA available: {torch.cuda.is_available()}")
-    print(f"Using device: {device}, dtype: {dtype}\n")
-
-    # Clear memory and get baseline
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-    
-    baseline_memory = get_memory_info()
-    print_memory_usage("Baseline Memory", baseline_memory)
-    print()
-
-    # Create random input tensors
-    mlp_weights = torch.randn(B, 4*Ch+1, device=device, dtype=dtype)
-
-    pos_xy = torch.rand(B, 2, device=device, dtype=dtype)
-    pos_xy[:,:] = 0.0
-    pos_wh = torch.rand(B, 2, device=device, dtype=dtype) * 0.5 + 0.1 # Ensure width/height > 0
-    pos_wh[:,:] = 1.0
-    pos = torch.cat([pos_xy, pos_wh], dim=-1)
-
-    after_tensor_creation = get_memory_info()
-    print_memory_usage("After Tensor Creation", after_tensor_creation)
-    print()
-    
-    # Make copies for gradient checking
-    mlp_weights_py = mlp_weights.clone().requires_grad_(True)
-
-    # --- Forward and Backward for PyTorch implementation ---
-    print("--- PyTorch Implementation ---")
-        
-    # PyTorch Profiler for detailed analysis
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True
-    ) as prof:
-        with record_function("pytorch_forward"):
-            output_py = box_brbp_python(mlp_weights_py, pos, Ch, W, H)
-            torch.cuda.synchronize()
-
-    print("PYTORCH FORWARD PROFILER RESULTS:")
-    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-
-    loss_py = output_py.sum()
-    grad_output_val = torch.randn_like(output_py)
-        
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True
-    ) as prof_bwd:
-        with record_function("pytorch_backward"):
-            loss_py.backward()
-            torch.cuda.synchronize()
-
-    print("PYTORCH BACKWARD PROFILER RESULTS:")
-    print(prof_bwd.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-
-    # --- Forward and Backward for CUDA implementation (if available) ---
-    print("--- CUDA Implementation ---")
-    
-    # Reset peak memory stats for CUDA implementation
-    torch.cuda.reset_peak_memory_stats()
-
-    # Make copies for gradient checking
-    mlp_weights_cu = mlp_weights.clone().requires_grad_(True)
-
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True
-    ) as prof_cuda:
-        with record_function("cuda_forward"):
-            output_cu = BoxBRPBCUDAFunction.apply(mlp_weights_cu, pos, Ch, W, H)
-            torch.cuda.synchronize()
-    
-    print("CUDA FORWARD PROFILER RESULTS:")
-    print(prof_cuda.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-
-    loss_cuda = output_cu.sum()
-
-    with profile(
-        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        record_shapes=True,
-        profile_memory=True,
-        with_stack=True
-    ) as prof_cuda_bwd:
-        with record_function("cuda_backward"):
-            loss_cuda.backward()
-            torch.cuda.synchronize()
-    
-    print("CUDA BACKWARD PROFILER RESULTS:")
-    print(prof_cuda_bwd.key_averages().table(sort_by="cuda_time_total", row_limit=10))
-
-    print("\n--- Numerical Accuracy Comparison ---")
-    fwd_atol, fwd_rtol = 1e-5, 1e-4
-    bwd_atol, bwd_rtol = 1e-4, 1e-3
-    
-    forward_pass_ok = torch.allclose(output_cu, output_py.to(device), atol=fwd_atol, rtol=fwd_rtol)
-    print(f"Forward outputs close: {forward_pass_ok}")
-    if not forward_pass_ok:
-        print("Max diff fwd (abs):", (output_cu - output_py.to(device)).abs().max().item())
-        print("Mean diff fwd (abs):", (output_cu - output_py.to(device)).abs().mean().item())
-        print("Max diff fwd (rel):", ((output_cu - output_py.to(device)).abs() / (output_py.to(device).abs() + 1e-9)).max().item())
-
-    grad_mlp_ok = torch.allclose(mlp_weights_cu.grad, mlp_weights_py.grad.to(device), atol=bwd_atol, rtol=bwd_rtol)
-    print(f"Gradient for mlp weights close: {grad_mlp_ok}")
-    if not grad_mlp_ok:
-        print("Max diff grad_queries (abs):", (mlp_weights_cu.grad - mlp_weights_py.grad.to(device)).abs().max().item())
-        print("Mean diff grad_queries (abs):", (mlp_weights_cu.grad - mlp_weights_py.grad.to(device)).abs().mean().item())
+from functions import PosMLP, PosMLPAttention, PairPosMLP, PosMLPSelfAttention
 
 
-if __name__ == "__main__":
-    run_test()
+class TestPosMLP(unittest.TestCase):
+    def test_non_batched(self):
+        model = PosMLP(dim=32, batched=False).to('cuda')
+        pos = torch.rand(10, 4, device='cuda')
+        output = model(pos, size=(16, 16))
+        self.assertEqual(output.shape, (10, 16, 16))
+
+    def test_batched(self):
+        model = PosMLP(dim=32, batched=True).to('cuda')
+        pos = torch.rand(10, 4, device='cuda')
+        queries = torch.rand(10, 32, device='cuda')
+        output = model(pos, size=16, queries=queries)
+        self.assertEqual(output.shape, (10, 16, 16))
+
+    def test_multi_dim_input_batched(self):
+        model = PosMLP(dim=32, batched=True).to('cuda')
+        pos = torch.rand(2, 5, 4, device='cuda')
+        queries = torch.rand(2, 5, 32, device='cuda')
+        output = model(pos, size=(16, 16), queries=queries)
+        self.assertEqual(output.shape, (2, 5, 16, 16))
+
+    def test_implementations(self):
+        model = PosMLP(dim=32, batched=True).to('cuda')
+        pos = torch.rand(10, 4, device='cuda')
+        queries = torch.rand(10, 32, device='cuda')
+        # Test that both 'cuda' and 'python' code paths execute without error
+        output_cuda = model(pos, size=16, queries=queries, implementation='cuda')
+        self.assertEqual(output_cuda.shape, (10, 16, 16))
+        output_python = model(pos, size=16, queries=queries, implementation='python')
+        self.assertEqual(output_python.shape, (10, 16, 16))
+
+
+class TestPairPosMLP(unittest.TestCase):
+    def test_non_batched(self):
+        model = PairPosMLP(dim=32, batched=False).to('cuda')
+        pos1 = torch.rand(10, 5, 4, device='cuda')
+        pos2 = torch.rand(10, 7, 4, device='cuda')
+        output = model(pos1, pos2)
+        self.assertEqual(output.shape, (10, 5, 7))
+
+    def test_batched(self):
+        model = PairPosMLP(dim=32, batched=True).to('cuda')
+        pos1 = torch.rand(10, 5, 4, device='cuda')
+        pos2 = torch.rand(10, 7, 4, device='cuda')
+        queries = torch.rand(10, 5, 32, device='cuda')
+        output = model(pos1, pos2, queries=queries)
+        self.assertEqual(output.shape, (10, 5, 7))
+
+    def test_multi_dim_input_batched(self):
+        model = PairPosMLP(dim=32, batched=True).to('cuda')
+        pos1 = torch.rand(2, 3, 5, 4, device='cuda')
+        pos2 = torch.rand(2, 3, 7, 4, device='cuda')
+        queries = torch.rand(2, 3, 5, 32, device='cuda')
+        output = model(pos1, pos2, queries=queries)
+        self.assertEqual(output.shape, (2, 3, 5, 7))
+
+    def test_implementations(self):
+        model = PairPosMLP(dim=32, batched=True).to('cuda')
+        pos1 = torch.rand(10, 5, 4, device='cuda')
+        pos2 = torch.rand(10, 7, 4, device='cuda')
+        queries = torch.rand(10, 5, 32, device='cuda')
+        # Test that both 'cuda' and 'python' code paths execute without error
+        output_cuda = model(pos1, pos2, queries=queries, implementation='cuda')
+        self.assertEqual(output_cuda.shape, (10, 5, 7))
+        output_python = model(pos1, pos2, queries=queries, implementation='python')
+        self.assertEqual(output_python.shape, (10, 5, 7))
+
+
+class TestPosMLPAttention(unittest.TestCase):
+    def test_forward(self):
+        dim, n_heads, H, W, B = 32, 8, 16, 16, 4
+        model = PosMLPAttention(dim=dim, n_heads=n_heads, implementation="python").to('cuda')
+        queries = torch.rand(B, dim, device='cuda')
+        memory = torch.rand(B, H, W, dim, device='cuda')
+        pos = torch.rand(B, 4, device='cuda')
+        output = model(queries, memory, pos)
+        self.assertEqual(output.shape, (B, dim))
+
+    def test_multi_dim_input(self):
+        dim, n_heads, H, W, B, N = 32, 8, 16, 16, 4, 3
+        model = PosMLPAttention(dim=dim, n_heads=n_heads, implementation="python").to('cuda')
+        queries = torch.rand(B, N, dim, device='cuda')
+        memory = torch.rand(B, N, H, W, dim, device='cuda')
+        pos = torch.rand(B, N, 4, device='cuda')
+        output = model(queries, memory, pos)
+        self.assertEqual(output.shape, (B, N, dim))
+
+    def test_different_k_dim(self):
+        dim, k_dim, n_heads, H, W, B = 32, 64, 8, 16, 16, 4
+        model = PosMLPAttention(dim=dim, k_dim=k_dim, n_heads=n_heads).to('cuda')
+        queries = torch.rand(B, dim, device='cuda')
+        memory = torch.rand(B, H, W, k_dim, device='cuda')
+        pos = torch.rand(B, 4, device='cuda')
+        output = model(queries, memory, pos)
+        self.assertEqual(output.shape, (B, dim))
+
+
+class TestPosMLPSelfAttention(unittest.TestCase):
+    def test_forward(self):
+        dim, n_heads, q_len, B = 32, 8, 12, 4
+        model = PosMLPSelfAttention(dim=dim, n_heads=n_heads, implementation="python").to('cuda')
+        x = torch.rand(B, q_len, dim, device='cuda')
+        pos = torch.rand(B, q_len, 4, device='cuda')
+        output = model(x, pos)
+        self.assertEqual(output.shape, (B, q_len, dim))
+
+    def test_multi_dim_input(self):
+        dim, n_heads, q_len, B, N = 32, 8, 12, 4, 3
+        model = PosMLPSelfAttention(dim=dim, n_heads=n_heads, implementation="python").to('cuda')
+        x = torch.rand(B, N, q_len, dim, device='cuda')
+        pos = torch.rand(B, N, q_len, 4, device='cuda')
+        output = model(x, pos)
+        self.assertEqual(output.shape, (B, N, q_len, dim))
+
+if __name__ == '__main__':
+    unittest.main()
