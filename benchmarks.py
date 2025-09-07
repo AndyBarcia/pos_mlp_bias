@@ -10,7 +10,8 @@ from functions import (
     BoxRPBCUDAFunction, box_rbp_python,
     BoxBRPBCUDAFunction, box_brbp_python,
     BoxPairRPBCUDAFunction, box_pair_rbp_python,
-    BoxPairBRPBCUDAFunction, box_pair_brbp_python
+    BoxPairBRPBCUDAFunction, box_pair_brbp_python,
+    AttentionCUDAFunction, attn_python
 )
 
 @contextmanager
@@ -263,8 +264,29 @@ def test_box_pair_brbp():
     tester.run(Ch=Ch)
 
 
+def test_attention():
+    B, Nh, Nq, Nk, C = 16, 8, 300, 300, 32
+
+    input_creators = {
+        "q": lambda device, dtype: torch.randn(B, Nh, Nq, C, device=device, dtype=dtype),
+        "k": lambda device, dtype: torch.randn(B, Nh, Nk, C, device=device, dtype=dtype),
+        "v": lambda device, dtype: torch.randn(B, Nh, Nk, C, device=device, dtype=dtype),
+    }
+    arg_order = ["q", "k", "v"]
+
+    tester = CUDAKernelTester(
+        cuda_function=AttentionCUDAFunction.apply,
+        python_function=attn_python,
+        input_creators=input_creators,
+        arg_order=arg_order
+    )    
+    tester.run()
+
+
 if __name__ == "__main__":
-    test_box_rbp()
-    test_box_brbp()
-    test_box_pair_rbp()
-    test_box_pair_brbp()
+    test_attention()
+    #test_box_rbp()
+    #test_box_brbp()
+    #test_box_pair_rbp()
+    #test_box_pair_brbp()
+

@@ -1,5 +1,11 @@
 #include <torch/extension.h>
 
+torch::Tensor attn_forward(
+    const torch::Tensor &Q, // (B, Nh, Nq, C)
+    const torch::Tensor &K, // (B, Nh, Nk, C)
+    const torch::Tensor &V // (B, Nh, Nk, Cv)
+);
+
 torch::Tensor fused_box_brpb_forward(
     const torch::Tensor& mlp_weights, // (B, [2*C' + C' + 1*C' + 1])
     const torch::Tensor& pos,    // (B,[x,y,w,h])
@@ -61,6 +67,7 @@ torch::Tensor fused_box_pair_brpb_backward(
 );
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("forward_attn", &attn_forward, "Fused Attention Forward (Multi-Head)");
     m.def("forward_brpb", &fused_box_brpb_forward, "Fused Attention Forward (Multi-Head)");
     m.def("backward_brpb", &fused_box_brpb_backward, "Fused Attention Backward (Multi-Head)");
     m.def("forward_rpb", &fused_box_rpb_forward, "Fused Attention Forward (Multi-Head)");

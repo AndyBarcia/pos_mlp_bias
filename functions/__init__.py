@@ -5,3 +5,5 @@ from .box_pair_rpb_function import BoxPairRPBCUDAFunction, box_pair_rbp_python
 from .box_pair_brpb_function import BoxPairBRPBCUDAFunction, box_pair_brbp_python
 
 from .box_rpb import PosMLP, PosMLPAttention, PairPosMLP, PosMLPSelfAttention
+
+from .attn_function import AttentionCUDAFunction, attn_python
