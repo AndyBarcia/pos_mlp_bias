@@ -362,15 +362,9 @@ class PosMLPAttention(torch.nn.Module):
         return_attn_logits: bool = False
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: # (..., Q, C)
         if self.normalize_before:
-            queries, logits = self.forward_pre(queries, memory, pos, query_pos_emb, memory_pos_emb, attn_mask, return_attn_logits)
+            return self.forward_pre(queries, memory, pos, query_pos_emb, memory_pos_emb, attn_mask, return_attn_logits)
         else:
-            queries, logits = self.forward_post(queries, memory, pos, query_pos_emb, memory_pos_emb, attn_mask, return_attn_logits)
-
-        if return_attn_logits:
-            return queries, logits
-        else:
-            return queries
-
+            return self.forward_post(queries, memory, pos, query_pos_emb, memory_pos_emb, attn_mask, return_attn_logits)
 
 class PosMLPSelfAttention(torch.nn.Module):
     """
@@ -547,11 +541,6 @@ class PosMLPSelfAttention(torch.nn.Module):
             The output tensor after self-attention, and optionally attention logits.
         """
         if self.normalize_before:
-            x, logits = self.forward_pre(x, pos, pos_emb, attn_mask, return_attn_logits)
+            return self.forward_pre(x, pos, pos_emb, attn_mask, return_attn_logits)
         else:
-            x, logits = self.forward_post(x, pos, pos_emb, attn_mask, return_attn_logits)
-
-        if return_attn_logits:
-            return x, logits
-        else:
-            return x
+            return self.forward_post(x, pos, pos_emb, attn_mask, return_attn_logits)
