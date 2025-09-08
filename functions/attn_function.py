@@ -16,9 +16,9 @@ except ImportError:
 class AttentionCUDAFunction(Function):
     @staticmethod
     def forward(ctx, q, k, v):
-        q = q.contiguous()
-        k = k.contiguous()
-        v = v.contiguous()
+        q = q.contiguous().float()
+        k = k.contiguous().float()
+        v = v.contiguous().float()
         ctx.save_for_backward(q, k, v)
         output = pos_mlp_bias.forward_attn(q, k ,v)
         return output

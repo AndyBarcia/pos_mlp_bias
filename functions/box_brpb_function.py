@@ -16,10 +16,10 @@ except ImportError:
 class BoxBRPBCUDAFunction(Function):
     @staticmethod
     def forward(ctx, mlp_weights, pos, c_hidden, H, W):
-        mlp_weights = mlp_weights.contiguous()
+        mlp_weights = mlp_weights.contiguous().float()
+        pos = pos.contiguous().float()
         ctx.save_for_backward(mlp_weights, pos)
         ctx.c_hidden = c_hidden
-        pos = pos.contiguous()
         output = pos_mlp_bias.forward_brpb(mlp_weights, pos, c_hidden, H, W)
         return output
 
