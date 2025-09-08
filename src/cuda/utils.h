@@ -66,3 +66,48 @@ void dispatch_kernel(
         }
     }
 }
+
+// Kernel dispatcher with default fallback to dynamic kernel if no match found.
+template <
+    typename Launcher,
+    typename DynamicLauncher,
+    size_t DimIndex = 0,
+    typename SupportedDimsTuple,
+    typename... MatchedDims
+>
+void dispatch_kernel_with_fallback(
+    const Launcher& launcher,
+    const DynamicLauncher& dynamic_launcher,
+    const std::tuple<int, int, int>& runtime_dims,
+    const SupportedDimsTuple& supported_dims,
+    MatchedDims... matched_dims
+) {
+    if constexpr (DimIndex == std::tuple_size_v<SupportedDimsTuple>) {
+        launcher(matched_dims...);
+    } else {
+        const int runtime_value = std::get<DimIndex>(runtime_dims);
+        const auto& supported_values_for_dim = std::get<DimIndex>(supported_dims);
+        bool dispatched = false;
+        
+        std::apply([&](auto... compile_time_options) {
+            ([&] {
+                if (!dispatched && runtime_value == decltype(compile_time_options)::value) {
+                    dispatch_kernel_with_fallback<Launcher, DynamicLauncher, DimIndex + 1>(
+                        launcher,
+                        dynamic_launcher,
+                        runtime_dims,
+                        supported_dims,
+                        matched_dims...,
+                        compile_time_options
+                    );
+                    dispatched = true;
+                }
+            }(), ...);
+        }, supported_values_for_dim);
+        
+        // If no template match found, use dynamic kernel
+        if (!dispatched) {
+            dynamic_launcher();
+        }
+    }
+}

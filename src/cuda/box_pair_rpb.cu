@@ -102,6 +102,98 @@ __global__ void box_pair_rbp_kernel(
     output[tid] = out_val;
 }
 
+template <int MAX_C_HIDDEN>
+__global__ void box_pair_rbp_dynamic_kernel(
+    const float* __restrict__ mlp_weights,
+    const float* __restrict__ boxes1,
+    const float* __restrict__ boxes2,
+    int B,
+    int N1,
+    int N2,
+    int C_HIDDEN,
+    float* __restrict__ output
+) {
+    // Calculate the total number of output elements (box pairs)
+    const int total_elements = B * N1 * N2;
+    // Get the global thread ID
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Boundary check to ensure the thread is within the problem size
+    if (tid >= total_elements) return;
+
+    // Map the 1D thread ID to 3D indices (batch, box1_index, box2_index)
+    const int b = tid / (N1 * N2);
+    const int n1n2_idx = tid % (N1 * N2);
+    const int n1 = n1n2_idx / N2;
+    const int n2 = n1n2_idx % N2;
+
+    // Pointers to the specific box data for this thread
+    const float* p_box1 = boxes1 + (b * N1 + n1) * 4;
+    const float* p_box2 = boxes2 + (b * N2 + n2) * 4;
+
+    // Load box parameters
+    const float cx1 = p_box1[0];
+    const float cy1 = p_box1[1];
+    const float w1 = p_box1[2];
+    const float h1 = p_box1[3];
+
+    const float cx2 = p_box2[0];
+    const float cy2 = p_box2[1];
+    const float w2 = p_box2[2];
+    const float h2 = p_box2[3];
+
+    // Compute relative features between the pair of boxes
+    const float epsilon = 1e-6f;
+    const float dx = (cx2 - cx1) / (w1 + epsilon);
+    const float dy = (cy2 - cy1) / (h1 + epsilon);
+    const float dw = logf(w2 / (w1 + epsilon));
+    const float dh = logf(h2 / (h1 + epsilon));
+
+    // Pointers to the different sections of the MLP weights
+    const float* w1_ptr = mlp_weights;
+    const float* b1_ptr = mlp_weights + 4 * C_HIDDEN;
+    const float* w2_ptr = mlp_weights + 5 * C_HIDDEN;
+    const float b2_val = mlp_weights[6 * C_HIDDEN];
+
+    // Temporary array to hold the hidden layer activations
+    float temp[MAX_C_HIDDEN];
+    float max_val = -FLT_MAX;
+
+    // First MLP layer
+    for (int k = 0; k < C_HIDDEN; k++) {
+        const float w_dx = w1_ptr[k];
+        const float w_dy = w1_ptr[C_HIDDEN + k];
+        const float w_dw = w1_ptr[2 * C_HIDDEN + k];
+        const float w_dh = w1_ptr[3 * C_HIDDEN + k];
+        const float b1 = b1_ptr[k];
+        
+        temp[k] = dx * w_dx + dy * w_dy + dw * w_dw + dh * w_dh + b1;
+        if (temp[k] > max_val) max_val = temp[k];
+    }
+
+    // Softmax activation function (numerically stable implementation)
+    float sum_exp = 0.0f;
+    for (int k = 0; k < C_HIDDEN; k++) {
+        temp[k] = __expf(temp[k] - max_val);
+        sum_exp += temp[k];
+    }
+
+    const float inv_sum_exp = 1.0f / sum_exp;
+    for (int k = 0; k < C_HIDDEN; k++) {
+        temp[k] *= inv_sum_exp;
+    }
+
+    // Second MLP layer
+    float out_val = 0.0f;
+    for (int k = 0; k < C_HIDDEN; k++) {
+        out_val += temp[k] * w2_ptr[k];
+    }
+    out_val += b2_val;
+
+    // Write the final result to the output tensor
+    output[tid] = out_val;
+}
+
 torch::Tensor fused_box_pair_rpb_forward(
     const torch::Tensor& mlp_weights, // ([4*C' + C' + 1*C' + 1])
     const torch::Tensor& pos1,    // (B,N1,[x,y,w,h])
@@ -111,6 +203,7 @@ torch::Tensor fused_box_pair_rpb_forward(
     CHECK_INPUT(mlp_weights);
     CHECK_INPUT(pos1);
     CHECK_INPUT(pos2);
+    TORCH_CHECK(c_hidden <= 16, "c_hidden must be <= 16");
 
     const int B = pos1.size(0);
     const int N1 = pos1.size(1);
@@ -120,15 +213,28 @@ torch::Tensor fused_box_pair_rpb_forward(
     const int total_elements = B * N1 * N2;
     const int blocks = (total_elements + THREADS_PER_BLOCK_FORWARD - 1) / THREADS_PER_BLOCK_FORWARD;
 
-    box_pair_rbp_kernel<16><<<blocks, THREADS_PER_BLOCK_FORWARD>>>(
-        mlp_weights.data_ptr<float>(),
-        pos1.data_ptr<float>(),
-        pos2.data_ptr<float>(),
-        B,
-        N1,
-        N2,
-        output.data_ptr<float>()
-    );
+    if (c_hidden == 16) {
+        box_pair_rbp_kernel<16><<<blocks, THREADS_PER_BLOCK_FORWARD>>>(
+            mlp_weights.data_ptr<float>(),
+            pos1.data_ptr<float>(),
+            pos2.data_ptr<float>(),
+            B,
+            N1,
+            N2,
+            output.data_ptr<float>()
+        );
+    } else {
+        box_pair_rbp_dynamic_kernel<16><<<blocks, THREADS_PER_BLOCK_FORWARD>>>(
+            mlp_weights.data_ptr<float>(),
+            pos1.data_ptr<float>(),
+            pos2.data_ptr<float>(),
+            B,
+            N1,
+            N2,
+            c_hidden,
+            output.data_ptr<float>()
+        );
+    }
 
     CHECK_CUDA_ERROR(cudaPeekAtLastError());
 
@@ -294,6 +400,7 @@ torch::Tensor fused_box_pair_rpb_backward(
     CHECK_INPUT(mlp_weights);
     CHECK_INPUT(pos1);
     CHECK_INPUT(pos2);
+    TORCH_CHECK(c_hidden != 16, "c_hidden must be 16 for the backward pass");
 
     const int B = pos1.size(0);
     const int N1 = pos1.size(1);

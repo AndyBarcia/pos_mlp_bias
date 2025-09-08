@@ -69,6 +69,67 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_FORWARD, 2) pos_mlp_bias_for
     output[tid] = out_val;
 }
 
+template <int MAX_C_HIDDEN>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK_FORWARD, 2) pos_mlp_bias_forward_dynamic_kernel(
+    const float* __restrict__ mlp_weights,
+    const float* __restrict__ pos,
+    int B,
+    int HEIGHT,
+    int WIDTH,
+    int C_HIDDEN,
+    float* __restrict__ output
+) {
+    const int total_elements = B * HEIGHT * WIDTH;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total_elements) return;
+
+    const int b = tid / (HEIGHT * WIDTH);
+    const int spatial_idx = tid % (HEIGHT * WIDTH);
+
+    const float i = ((float) (spatial_idx / WIDTH)) / (float) (HEIGHT-1);
+    const float j = ((float) (spatial_idx % WIDTH)) / (float) (WIDTH-1);
+
+    const float cx = pos[b * 4 + 0];
+    const float cy = pos[b * 4 + 1];
+    const float half_w = fmaxf(pos[b * 4 + 2] * 0.5f, 1e-6f);
+    const float half_h = fmaxf(pos[b * 4 + 3] * 0.5f, 1e-6f);
+
+    const float rel_x = (j - cx) / half_w;
+    const float rel_y = (i - cy) / half_h;
+
+    const int weights_offset = b * (4 * C_HIDDEN + 1);
+    const float* w = &mlp_weights[weights_offset];
+
+    float temp[MAX_C_HIDDEN];
+    float max_val = -FLT_MAX;
+    for (int k = 0; k < C_HIDDEN; k++) {
+        const float w_x = w[2 * k];
+        const float w_y = w[2 * k + 1];
+        const float b1 = w[2 * C_HIDDEN + k];
+        temp[k] = rel_x * w_x + rel_y * w_y + b1;
+        if (temp[k] > max_val) max_val = temp[k];
+    }
+
+    float sum_exp = 0.0f;
+    for (int k = 0; k < C_HIDDEN; k++) {
+        temp[k] = __expf(temp[k] - max_val);
+        sum_exp += temp[k];
+    }
+
+    const float inv_sum_exp = 1.0f / sum_exp;
+    for (int k = 0; k < C_HIDDEN; k++) {
+        temp[k] *= inv_sum_exp;
+    }
+
+    float out_val = 0.0f;
+    for (int k = 0; k < C_HIDDEN; k++) {
+        out_val += temp[k] * w[3 * C_HIDDEN + k];
+    }
+    out_val += w[4 * C_HIDDEN];
+
+    output[tid] = out_val;
+}
+
 torch::Tensor fused_box_brpb_forward(
     const torch::Tensor& mlp_weights, // (B, [2*C' + C' + 1*C' + 1])
     const torch::Tensor& pos,    // (B,[x,y,w,h])
@@ -95,10 +156,35 @@ torch::Tensor fused_box_brpb_forward(
         );
     };
 
+    // Dynamic kernel launcher (fallback)
+    auto launch_dynamic_kernel = [&]() {
+        pos_mlp_bias_forward_dynamic_kernel<16><<<blocks, THREADS_PER_BLOCK_FORWARD>>>(
+            mlp_weights.data_ptr<float>(),
+            pos.data_ptr<float>(),
+            B,
+            height, 
+            width, 
+            c_hidden,
+            output.data_ptr<float>()
+        );
+    };
+
     // Define the supported dimensions in a clear and centralized way.
     const auto supported_dims = std::make_tuple(
-        std::make_tuple(std::integral_constant<int, 8>{}, std::integral_constant<int, 16>{}, std::integral_constant<int, 32>{}, std::integral_constant<int, 64>{}), // height
-        std::make_tuple(std::integral_constant<int, 8>{}, std::integral_constant<int, 16>{}, std::integral_constant<int, 32>{}, std::integral_constant<int, 64>{}), // width
+        std::make_tuple(
+            std::integral_constant<int, 8>{}, 
+            std::integral_constant<int, 16>{}, 
+            std::integral_constant<int, 32>{}, 
+            std::integral_constant<int, 64>{},
+            std::integral_constant<int, 128>{}
+        ), // height
+        std::make_tuple(
+            std::integral_constant<int, 8>{}, 
+            std::integral_constant<int, 16>{}, 
+            std::integral_constant<int, 32>{}, 
+            std::integral_constant<int, 64>{},
+            std::integral_constant<int, 128>{}
+        ), // width
         std::make_tuple(std::integral_constant<int, 16>{})  // c_hidden
     );
 
@@ -106,7 +192,7 @@ torch::Tensor fused_box_brpb_forward(
     const auto runtime_dims = std::make_tuple(height, width, c_hidden);
 
     // Call the generalized dispatcher.
-    dispatch_kernel(launch_kernel, runtime_dims, supported_dims);
+    dispatch_kernel_with_fallback(launch_kernel, launch_dynamic_kernel, runtime_dims, supported_dims);
 
     CHECK_CUDA_ERROR(cudaPeekAtLastError());
 
@@ -259,8 +345,20 @@ torch::Tensor fused_box_brpb_backward(
 
     // Define the supported dimensions in a clear and centralized way.
     const auto supported_dims = std::make_tuple(
-        std::make_tuple(std::integral_constant<int, 8>{}, std::integral_constant<int, 16>{}, std::integral_constant<int, 32>{}, std::integral_constant<int, 64>{}), // height
-        std::make_tuple(std::integral_constant<int, 8>{}, std::integral_constant<int, 16>{}, std::integral_constant<int, 32>{}, std::integral_constant<int, 64>{}), // width
+        std::make_tuple(
+            std::integral_constant<int, 8>{}, 
+            std::integral_constant<int, 16>{}, 
+            std::integral_constant<int, 32>{}, 
+            std::integral_constant<int, 64>{},
+            std::integral_constant<int, 128>{}
+        ), // height
+        std::make_tuple(
+            std::integral_constant<int, 8>{}, 
+            std::integral_constant<int, 16>{}, 
+            std::integral_constant<int, 32>{}, 
+            std::integral_constant<int, 64>{},
+            std::integral_constant<int, 128>{}
+        ), // width
         std::make_tuple(std::integral_constant<int, 16>{})  // c_hidden
     );
 

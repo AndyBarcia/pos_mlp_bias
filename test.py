@@ -18,6 +18,13 @@ class TestPosMLP(unittest.TestCase):
         output = model(pos, size=16, queries=queries)
         self.assertEqual(output.shape, (10, 16, 16))
 
+    def test_dynamic_kernel(self):
+        model = PosMLP(dim=32, batched=True).to('cuda')
+        pos = torch.rand(10, 4, device='cuda')
+        queries = torch.rand(10, 32, device='cuda')
+        output = model(pos, size=(13,12), queries=queries)
+        self.assertEqual(output.shape, (10, 13, 12))
+
     def test_multi_dim_input_batched(self):
         model = PosMLP(dim=32, batched=True).to('cuda')
         pos = torch.rand(2, 5, 4, device='cuda')
@@ -75,6 +82,15 @@ class TestPairPosMLP(unittest.TestCase):
 class TestPosMLPAttention(unittest.TestCase):
     def test_forward(self):
         dim, n_heads, Q, H, W, B = 32, 8, 10, 16, 16, 4
+        model = PosMLPAttention(dim=dim, n_heads=n_heads, implementation="python").to('cuda')
+        queries = torch.rand(B, Q, dim, device='cuda')
+        memory = torch.rand(B, H, W, dim, device='cuda')
+        pos = torch.rand(B, Q, 4, device='cuda')
+        output = model(queries, memory, pos)
+        self.assertEqual(output.shape, (B, Q, dim))
+
+    def test_dynamic_forward(self):
+        dim, n_heads, Q, H, W, B = 32, 8, 10, 24, 13, 4
         model = PosMLPAttention(dim=dim, n_heads=n_heads, implementation="python").to('cuda')
         queries = torch.rand(B, Q, dim, device='cuda')
         memory = torch.rand(B, H, W, dim, device='cuda')
