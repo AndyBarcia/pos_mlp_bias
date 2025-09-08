@@ -39,6 +39,13 @@ class PosMLP(torch.nn.Module):
         else:
             self.weights = torch.nn.Parameter(torch.randn(4 * hidden_dim + 1))
 
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                torch.nn.init.xavier_uniform_(p)
+
     def forward(
         self,
         pos: torch.Tensor, # (...,[x,y,w,h])
@@ -108,7 +115,14 @@ class PairPosMLP(torch.nn.Module):
             self.weight_generator = torch.nn.Linear(dim, 6 * hidden_dim + 1)
         else:
             self.weights = torch.nn.Parameter(torch.randn(6 * hidden_dim + 1))
+        
+        self._reset_parameters()
 
+    def _reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                torch.nn.init.xavier_uniform_(p)
+    
     def forward(
         self,
         pos1: torch.Tensor, # (...,N1,[x,y,w,h])
@@ -165,6 +179,8 @@ class PosMLPAttention(torch.nn.Module):
         hidden_dim: int = 16,
         n_heads: int = 8,
         batched_rpb: bool = True,
+        normalize_before: bool = False,
+        dropout: float = 0.0,
         implementation: str = "cuda"
     ):
         super().__init__()
@@ -183,78 +199,177 @@ class PosMLPAttention(torch.nn.Module):
 
         self.scale = self.head_dim ** -0.5
 
-    def forward(
+        self.norm = torch.nn.LayerNorm(dim)
+        self.dropout = torch.nn.Dropout(dropout)
+
+        self.normalize_before = normalize_before
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                torch.nn.init.xavier_uniform_(p)
+    
+    def with_pos_embed(self, tensor: torch.Tensor, pos: Optional[torch.Tensor]):
+            return tensor if pos is None else tensor + pos
+
+    def forward_inner(
         self,
-        queries: torch.Tensor, # (..., C)
+        queries: torch.Tensor, # (..., Q, C)
         memory: torch.Tensor, # (..., H, W, k_dim)
-        pos: torch.Tensor, # (..., [x, y, w, h])
-    ) -> torch.Tensor: # (..., C)
+        pos: torch.Tensor, # (..., Q, [x, y, w, h])
+        query_pos_emb: Optional[torch.Tensor] = None, # (..., Q, C)
+        memory_pos_emb: Optional[torch.Tensor] = None, # (..., H, W, k_dim)
+        attn_mask: Optional[torch.Tensor] = None, # (..., Q, H*W)
+        return_attn_logits: bool = False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: # (..., Q, C)
         """
-        Forward pass for PosMLPAttention.
+        Inner forward pass for PosMLPAttention.
 
         Args:
             queries: The query tensor.
             memory: The key/value source tensor (a 2D feature map).
             pos: The positional information corresponding to the queries.
+            query_pos_emb: Optional positional embeddings for the queries.
+            memory_pos_emb: Optional positional embeddings for the memory.
+            attn_mask: Optional attention mask.
 
         Returns:
             The output tensor after attention.
         """
-        assert memory.shape[-1] == self.k_dim, \
-            f"Memory feature dimension ({memory.shape[-1]}) must match k_dim ({self.k_dim})"
+        # Add positional embeddings if provided
+        queries = self.with_pos_embed(queries, query_pos_emb)
+        memory = self.with_pos_embed(memory, memory_pos_emb)
 
-        queries, queries_ps = pack([queries], "* c")
+        # Flatten batch dimensions
+        queries, queries_ps = pack([queries], "* q c")
         memory, _ = pack([memory], "* h w c")
-        pos, _ = pack([pos], "* xywh")
+        pos, _ = pack([pos], "* q xywh")
+
+        assert (memory.shape[-1] == self.k_dim), (
+            f"Memory feature dimension ({memory.shape[-1]}) must match k_dim ({self.k_dim})"
+        )
+        assert (queries.shape[0] == pos.shape[0]), (
+            f"Batch size of queries ({queries.shape[0]}) must match batch size of pos ({pos.shape[0]})"
+        )
 
         batch_size = queries.shape[0]
         H, W = memory.shape[1], memory.shape[2]
+        n_queries = queries.shape[1]
 
         # Flatten spatial dimensions of memory
         memory_flat = memory.view(batch_size, H * W, -1)  # (B, H*W, k_dim)
 
         # Compute Q, K, V
-        Q = self.q_proj(queries)  # (B, dim)
+        Q = self.q_proj(queries)  # (B, Q, dim)
         K, V = self.kv_proj(memory_flat).chunk(2, dim=-1)  # Each: (B, H*W, dim)
 
         # Reshape for multi-head attention
-        Q = Q.view(batch_size, 1, self.n_heads, self.head_dim)
+        Q = Q.view(batch_size, n_queries, self.n_heads, self.head_dim)
         K = K.view(batch_size, H * W, self.n_heads, self.head_dim)
         V = V.view(batch_size, H * W, self.n_heads, self.head_dim)
 
         # Transpose for attention computation
-        Q = Q.transpose(1, 2)  # (B, n_heads, 1, head_dim)
+        Q = Q.transpose(1, 2)  # (B, n_heads, Q, head_dim)
         K = K.transpose(1, 2)  # (B, n_heads, H*W, head_dim)
         V = V.transpose(1, 2)  # (B, n_heads, H*W, head_dim)
 
         # Compute attention scores
-        attention = torch.matmul(Q, K.transpose(-2, -1)) * self.scale  # (B, n_heads, 1, H*W)
+        attention_logits = torch.matmul(Q, K.transpose(-2, -1)) * self.scale  # (B, n_heads, Q, H*W)
 
-        # Reshape attention to add positional bias
-        attention = attention.view(batch_size, self.n_heads, H, W)
+        # Reshape attention logits to (B, n_heads, Q, H, W) for adding positional bias
+        attention_logits = attention_logits.view(batch_size, self.n_heads, n_queries, H, W)
 
         # Add positional bias
-        pos_bias = self.pos_mlp(pos, (H, W), queries)  # (B, H, W)
-        attention = attention + pos_bias.unsqueeze(1) # (B, n_heads, H, W)
+        pos_bias = self.pos_mlp(pos, (H, W), queries)  # (B, Q, H, W)
+        attention_logits = attention_logits + pos_bias.unsqueeze(1) # (B, n_heads, Q, H, W)
+
+        # Apply attention mask if provided
+        if attn_mask is not None:
+            attn_mask = attn_mask.view(batch_size, self.n_heads, n_queries, H, W)
+            attention_logits = attention_logits.masked_fill(attn_mask, float('-inf'))
 
         # Flatten back for softmax
-        attention = attention.view(batch_size, self.n_heads, 1, H * W)
+        attention_logits = attention_logits.view(batch_size, self.n_heads, n_queries, H * W)
 
         # Apply softmax
-        attention_weights = F.softmax(attention, dim=-1)
+        attention_weights = F.softmax(attention_logits, dim=-1)
 
         # Apply attention to values
-        output = torch.matmul(attention_weights, V)  # (B, n_heads, 1, head_dim)
+        output = torch.matmul(attention_weights, V)  # (B, n_heads, Q, head_dim)
 
         # Reshape and concatenate heads
-        output = output.transpose(1, 2).contiguous().view(batch_size, self.dim)
+        output = output.transpose(1, 2).contiguous().view(batch_size, n_queries, self.dim)
 
         # Final linear projection
-        output = self.out_proj(output)
+        output = self.out_proj(output) # (B, Q, dim)
 
         # Unpack to original shape
-        output, = unpack(output, queries_ps, "* c")
-        return output
+        output, = unpack(output, queries_ps, "* q c")
+
+        if return_attn_logits:
+            attn_logits_shape = queries_ps[0] + (self.n_heads, n_queries, H * W)
+            return output, attention_logits.view(attn_logits_shape)
+        else:
+            return output, None
+    
+    def forward_pre(
+        self,
+        queries: torch.Tensor, # (..., Q, C)
+        memory: torch.Tensor, # (..., H, W, k_dim)
+        pos: torch.Tensor, # (..., Q, [x, y, w, h])
+        query_pos_emb: Optional[torch.Tensor] = None, # (..., Q, C)
+        memory_pos_emb: Optional[torch.Tensor] = None, # (..., H, W, k_dim)
+        attn_mask: Optional[torch.Tensor] = None, # (..., Q, H*W)
+        return_attn_logits: bool = False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: # (..., Q, C)
+        # Normalize queries
+        queries = self.norm(queries)
+        # Apply attention to the residual stream.
+        attention, logits = self.forward_inner(
+            queries, memory, pos, query_pos_emb, memory_pos_emb, attn_mask, return_attn_logits
+        )
+        queries = queries + self.dropout(attention)
+        return queries, logits
+    
+    def forward_post(
+        self,
+        queries: torch.Tensor, # (..., Q, C)
+        memory: torch.Tensor, # (..., H, W, k_dim)
+        pos: torch.Tensor, # (..., Q, [x, y, w, h])
+        query_pos_emb: Optional[torch.Tensor] = None, # (..., Q, C)
+        memory_pos_emb: Optional[torch.Tensor] = None, # (..., H, W, k_dim)
+        attn_mask: Optional[torch.Tensor] = None, # (..., Q, H*W)
+        return_attn_logits: bool = False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: # (..., Q, C)
+        # Apply attention to the residual stream.
+        attention, logits = self.forward_inner(
+            queries, memory, pos, query_pos_emb, memory_pos_emb, attn_mask, return_attn_logits
+        )
+        queries = queries + self.dropout(attention)
+        # Normalize queries
+        queries = self.norm(queries)
+        return queries, logits
+
+    def forward(
+        self,
+        queries: torch.Tensor, # (..., Q, C)
+        memory: torch.Tensor, # (..., H, W, k_dim)
+        pos: torch.Tensor, # (..., Q, [x, y, w, h])
+        query_pos_emb: Optional[torch.Tensor] = None, # (..., Q, C)
+        memory_pos_emb: Optional[torch.Tensor] = None, # (..., H, W, k_dim)
+        attn_mask: Optional[torch.Tensor] = None, # (..., Q, H*W)
+        return_attn_logits: bool = False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: # (..., Q, C)
+        if self.normalize_before:
+            queries, logits = self.forward_pre(queries, memory, pos, query_pos_emb, memory_pos_emb, attn_mask, return_attn_logits)
+        else:
+            queries, logits = self.forward_post(queries, memory, pos, query_pos_emb, memory_pos_emb, attn_mask, return_attn_logits)
+
+        if return_attn_logits:
+            return queries, logits
+        else:
+            return queries
 
 
 class PosMLPSelfAttention(torch.nn.Module):
@@ -267,6 +382,8 @@ class PosMLPSelfAttention(torch.nn.Module):
         hidden_dim: int = 16,
         n_heads: int = 8,
         batched_rpb: bool = True,
+        normalize_before: bool = False,
+        dropout: float = 0.0,
         implementation: str = "cuda"
     ):
         super().__init__()
@@ -283,21 +400,45 @@ class PosMLPSelfAttention(torch.nn.Module):
 
         self.scale = self.head_dim ** -0.5
 
-    def forward(
+        self.norm = torch.nn.LayerNorm(dim)
+        self.dropout = torch.nn.Dropout(dropout)
+
+        self.normalize_before = normalize_before
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                torch.nn.init.xavier_uniform_(p)
+    
+    def with_pos_embed(self, tensor: torch.Tensor, pos: Optional[torch.Tensor]):
+        return tensor if pos is None else tensor + pos
+
+    def forward_inner(
         self,
         x: torch.Tensor, # (..., Q, C)
         pos: torch.Tensor, # (..., Q, [x,y,w,h])
-    ) -> torch.Tensor: # (..., Q, C)
+        pos_emb: Optional[torch.Tensor] = None, # (..., Q, C)
+        attn_mask: Optional[torch.Tensor] = None, # (..., Q, Q)
+        return_attn_logits: bool = False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: # (..., Q, C)
         """
-        Forward pass for PosMLPSelfAttention.
+        Inner forward pass for PosMLPSelfAttention.
 
         Args:
             x: The input sequence tensor.
             pos: The positional information for each element in the sequence.
+            pos_emb: Optional positional embeddings for the input.
+            attn_mask: Optional attention mask.
+            return_attn_logits: Whether to return attention logits.
 
         Returns:
-            The output tensor after self-attention.
+            The output tensor after self-attention and optionally attention logits.
         """
+        # Add positional embeddings if provided
+        x = self.with_pos_embed(x, pos_emb)
+
+        # Flatten batch dimensions
         x, x_ps = pack([x], "* q c")
         pos, _ = pack([pos], "* q xywh")
 
@@ -317,15 +458,20 @@ class PosMLPSelfAttention(torch.nn.Module):
         v = v.transpose(1, 2) # (B, n_heads, Q, head_dim)
 
         # Compute attention scores
-        attention = torch.matmul(q, k.transpose(-2, -1)) * self.scale # (B, n_heads, Q, Q)
+        attention_logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale # (B, n_heads, Q, Q)
 
         # Add pairwise positional bias
         # The bias is generated based on the original features `x` for batched mode
         pos_bias = self.pos_mlp(pos, pos, x) # (B, Q, Q)
-        attention = attention + pos_bias.unsqueeze(1) # Broadcast bias across heads
+        attention_logits = attention_logits + pos_bias.unsqueeze(1) # Broadcast bias across heads
+
+        # Apply attention mask if provided
+        if attn_mask is not None:
+            attn_mask = attn_mask.view(batch_size, 1, q_len, q_len)  # Add head dimension
+            attention_logits = attention_logits.masked_fill(attn_mask, float('-inf'))
 
         # Apply softmax
-        attention_weights = F.softmax(attention, dim=-1)
+        attention_weights = F.softmax(attention_logits, dim=-1)
 
         # Apply attention to values
         output = torch.matmul(attention_weights, v)
@@ -338,4 +484,74 @@ class PosMLPSelfAttention(torch.nn.Module):
 
         # Unpack to original shape
         output, = unpack(output, x_ps, "* q c")
-        return output
+
+        if return_attn_logits:
+            attn_logits_shape = x_ps[0] + (self.n_heads, q_len, q_len)
+            return output, attention_logits.view(attn_logits_shape)
+        else:
+            return output, None
+
+    def forward_pre(
+        self,
+        x: torch.Tensor, # (..., Q, C)
+        pos: torch.Tensor, # (..., Q, [x,y,w,h])
+        pos_emb: Optional[torch.Tensor] = None, # (..., Q, C)
+        attn_mask: Optional[torch.Tensor] = None, # (..., Q, Q)
+        return_attn_logits: bool = False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: # (..., Q, C)
+        # Normalize input
+        x_norm = self.norm(x)
+        # Apply attention
+        attention, logits = self.forward_inner(
+            x_norm, pos, pos_emb, attn_mask, return_attn_logits
+        )
+        x = x + self.dropout(attention)
+        return x, logits
+    
+    def forward_post(
+        self,
+        x: torch.Tensor, # (..., Q, C)
+        pos: torch.Tensor, # (..., Q, [x,y,w,h])
+        pos_emb: Optional[torch.Tensor] = None, # (..., Q, C)
+        attn_mask: Optional[torch.Tensor] = None, # (..., Q, Q)
+        return_attn_logits: bool = False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: # (..., Q, C)
+        # Apply attention
+        attention, logits = self.forward_inner(
+            x, pos, pos_emb, attn_mask, return_attn_logits
+        )
+        x = x + self.dropout(attention)
+        # Normalize output
+        x = self.norm(x)
+        return x, logits
+
+    def forward(
+        self,
+        x: torch.Tensor, # (..., Q, C)
+        pos: torch.Tensor, # (..., Q, [x,y,w,h])
+        pos_emb: Optional[torch.Tensor] = None, # (..., Q, C)
+        attn_mask: Optional[torch.Tensor] = None, # (..., Q, Q)
+        return_attn_logits: bool = False
+    ) -> torch.Tensor: # (..., Q, C)
+        """
+        Forward pass for PosMLPSelfAttention.
+
+        Args:
+            x: The input sequence tensor.
+            pos: The positional information for each element in the sequence.
+            pos_emb: Optional positional embeddings for the input.
+            attn_mask: Optional attention mask.
+            return_attn_logits: Whether to return attention logits.
+
+        Returns:
+            The output tensor after self-attention, and optionally attention logits.
+        """
+        if self.normalize_before:
+            x, logits = self.forward_pre(x, pos, pos_emb, attn_mask, return_attn_logits)
+        else:
+            x, logits = self.forward_post(x, pos, pos_emb, attn_mask, return_attn_logits)
+
+        if return_attn_logits:
+            return x, logits
+        else:
+            return x
