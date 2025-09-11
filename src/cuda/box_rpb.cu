@@ -184,7 +184,12 @@ torch::Tensor fused_box_rpb_forward(
             std::integral_constant<int, 64>{},
             std::integral_constant<int, 128>{}
         ), // width
-        std::make_tuple(std::integral_constant<int, 16>{})  // c_hidden
+        std::make_tuple(
+            std::integral_constant<int, 16>{},
+            std::integral_constant<int, 32>{},
+            std::integral_constant<int, 64>{},
+            std::integral_constant<int, 128>{}
+        )  // c_hidden
     );
 
     // The runtime values that need to be dispatched.
@@ -340,9 +345,26 @@ torch::Tensor fused_box_rpb_backward(
 
     // Define the supported dimensions in a clear and centralized way.
     const auto supported_dims = std::make_tuple(
-        std::make_tuple(std::integral_constant<int, 8>{}, std::integral_constant<int, 16>{}, std::integral_constant<int, 32>{}, std::integral_constant<int, 64>{}), // height
-        std::make_tuple(std::integral_constant<int, 8>{}, std::integral_constant<int, 16>{}, std::integral_constant<int, 32>{}, std::integral_constant<int, 64>{}), // width
-        std::make_tuple(std::integral_constant<int, 16>{})  // c_hidden
+        std::make_tuple(
+            std::integral_constant<int, 8>{}, 
+            std::integral_constant<int, 16>{}, 
+            std::integral_constant<int, 32>{}, 
+            std::integral_constant<int, 64>{},
+            std::integral_constant<int, 128>{}
+        ), // height
+        std::make_tuple(
+            std::integral_constant<int, 8>{}, 
+            std::integral_constant<int, 16>{}, 
+            std::integral_constant<int, 32>{}, 
+            std::integral_constant<int, 64>{},
+            std::integral_constant<int, 128>{}
+        ), // width
+        std::make_tuple(
+            std::integral_constant<int, 16>{},
+            std::integral_constant<int, 32>{},
+            std::integral_constant<int, 64>{},
+            std::integral_constant<int, 128>{}
+        )  // c_hidden
     );
 
     // The runtime values that need to be dispatched.

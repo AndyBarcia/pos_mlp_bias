@@ -185,7 +185,12 @@ torch::Tensor fused_box_brpb_forward(
             std::integral_constant<int, 64>{},
             std::integral_constant<int, 128>{}
         ), // width
-        std::make_tuple(std::integral_constant<int, 16>{})  // c_hidden
+        std::make_tuple(
+            std::integral_constant<int, 16>{},
+            std::integral_constant<int, 32>{},
+            std::integral_constant<int, 64>{},
+            std::integral_constant<int, 128>{}
+        )  // c_hidden
     );
 
     // The runtime values that need to be dispatched.
@@ -225,15 +230,10 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 4) pos_mlp_bias_backward_ke
         p_grad[i] = 0.0f;
     }
 
-    // Cooperatively load mlp_weights into shared memory.
-    // This access is fully coalesced.
-    if (tid < grad_size) {
-        s_weights[tid] = mlp_weights[b * grad_size + tid];
-    }
-
-    // 0-initialize shared memory for gradients
-    if (tid < grad_size) {
-        s_grad[tid] = 0.0f;
+    // Cooperatively load mlp_weights into shared memory and zero s_grad
+    for (int idx = tid; idx < grad_size; idx += blockDim.x) {
+        s_weights[idx] = mlp_weights[b * grad_size + idx];
+        s_grad[idx] = 0.0f;
     }
     __syncthreads();
 
@@ -308,9 +308,9 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 4) pos_mlp_bias_backward_ke
     
     __syncthreads();
 
-    // Write final result from shared memory to global memory.
-    if (tid < grad_size) {
-        grad_weights[b * grad_size + tid] = s_grad[tid];
+    // Write final result from shared memory to global memory using a strided loop
+    for (int idx = tid; idx < grad_size; idx += blockDim.x) {
+        grad_weights[b * grad_size + idx] = s_grad[idx];
     }
 }
 
@@ -359,7 +359,12 @@ torch::Tensor fused_box_brpb_backward(
             std::integral_constant<int, 64>{},
             std::integral_constant<int, 128>{}
         ), // width
-        std::make_tuple(std::integral_constant<int, 16>{})  // c_hidden
+        std::make_tuple(
+            std::integral_constant<int, 16>{},
+            std::integral_constant<int, 32>{},
+            std::integral_constant<int, 64>{},
+            std::integral_constant<int, 128>{}
+        )  // c_hidden
     );
 
     // The runtime values that need to be dispatched.
