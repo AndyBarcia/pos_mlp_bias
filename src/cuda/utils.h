@@ -24,11 +24,12 @@ template <
     typename Launcher,
     size_t DimIndex = 0,
     typename SupportedDimsTuple,
+    typename RuntimeDimsTuple,
     typename... MatchedDims
 >
 void dispatch_kernel(
     const Launcher& launcher,
-    const std::tuple<int, int, int>& runtime_dims,
+    const RuntimeDimsTuple& runtime_dims,
     const SupportedDimsTuple& supported_dims,
     MatchedDims... matched_dims // Accumulator for matched std::integral_constant types
 ) {
@@ -73,12 +74,13 @@ template <
     typename DynamicLauncher,
     size_t DimIndex = 0,
     typename SupportedDimsTuple,
+    typename RuntimeDimsTuple,
     typename... MatchedDims
 >
 void dispatch_kernel_with_fallback(
     const Launcher& launcher,
     const DynamicLauncher& dynamic_launcher,
-    const std::tuple<int, int, int>& runtime_dims,
+    const RuntimeDimsTuple& runtime_dims,
     const SupportedDimsTuple& supported_dims,
     MatchedDims... matched_dims
 ) {

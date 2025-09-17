@@ -9,9 +9,10 @@ from contextlib import contextmanager
 from functions import (
     BoxRPBCUDAFunction, box_rbp_python,
     BoxBRPBCUDAFunction, box_brbp_python,
+    BoxBMHRPBCUDAFunction, box_bmhrbp_python,
     BoxPairRPBCUDAFunction, box_pair_rbp_python,
     BoxPairBRPBCUDAFunction, box_pair_brbp_python,
-    AttentionCUDAFunction, attn_python
+    AttentionCUDAFunction, attn_python,
 )
 
 @contextmanager
@@ -194,7 +195,7 @@ def test_box_rbp():
 
 def test_box_brbp():
     B, Ch = 16 * 300, 16
-    H, W = 64, 64
+    H, W = 128, 128
 
     input_creators = {
         "mlp_weights": lambda device, dtype: torch.randn(B, 4 * Ch + 1, device=device, dtype=dtype),
@@ -212,6 +213,29 @@ def test_box_brbp():
         arg_order=arg_order
     )    
     tester.run(Ch=Ch, W=W, H=H)
+
+
+def test_box_bmhrbp():
+    B, Ch = 16*300, 16
+    H, W = 64, 64
+    Nh = 8
+
+    input_creators = {
+        "mlp_weights": lambda device, dtype: torch.randn(B, 2 * Ch + Ch + Ch * Nh + Nh, device=device, dtype=dtype),
+        "pos": lambda device, dtype: torch.cat([
+            torch.rand(B, 2, device=device, dtype=dtype),
+            torch.rand(B, 2, device=device, dtype=dtype) * 0.5 + 0.1
+        ], dim=-1),
+    }
+    arg_order = ["mlp_weights", "pos", "Ch", "Nh", "H", "W"]
+
+    tester = CUDAKernelTester(
+        cuda_function=BoxBMHRPBCUDAFunction.apply,
+        python_function=box_bmhrbp_python,
+        input_creators=input_creators,
+        arg_order=arg_order
+    )    
+    tester.run(Ch=Ch, Nh=Nh, W=W, H=H)
 
 
 def test_box_pair_rbp():
@@ -284,9 +308,9 @@ def test_attention():
 
 
 if __name__ == "__main__":
-    test_attention()
+    #test_attention()
     #test_box_rbp()
     #test_box_brbp()
     #test_box_pair_rbp()
     #test_box_pair_brbp()
-
+    test_box_bmhrbp()

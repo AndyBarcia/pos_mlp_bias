@@ -42,9 +42,22 @@ class PosMLP(torch.nn.Module):
         self._reset_parameters()
 
     def _reset_parameters(self):
-        for p in self.parameters():
-            if p.dim() > 1:
-                torch.nn.init.xavier_uniform_(p)
+        if self.batched:
+            # Normal initialization of weights with low gain so that it has lower
+            # effect.
+            torch.nn.init.xavier_uniform_(self.weight_generator.weight, gain=0.1)
+            # Normal initialization of the weights encoded in the bias.
+            C = self.hidden_dim
+            w1 = self.weight_generator.bias[0:2*C].view(C,2) # (C',[dx,dy])
+            w2 = self.weight_generator.bias[2*C+C : 2*C+C+C].view(C,1) # (C',1)
+            torch.nn.init.xavier_uniform_(w1)
+            torch.nn.init.xavier_uniform_(w2)
+        else:
+            C = self.hidden_dim
+            w1 = self.weights[0:2*C].view(C,2) # (C',[dx,dy])
+            w2 = self.weights[2*C+C : 2*C+C+C].view(C,1) # (C',1)
+            torch.nn.init.xavier_uniform_(w1)
+            torch.nn.init.xavier_uniform_(w2)
 
     def forward(
         self,
