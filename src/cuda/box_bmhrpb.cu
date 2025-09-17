@@ -9,7 +9,7 @@
 #include "utils.h"
 
 const int THREADS_PER_BLOCK_FORWARD = 512;
-const int THREADS_PER_BLOCK = 256;
+//const int THREADS_PER_BLOCK = 256;
 
 template <int HEIGHT, int WIDTH, int C_HIDDEN, int N_HEADS>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK_FORWARD, 2) pos_mlp_multi_head_bias_forward_kernel(
@@ -211,134 +211,143 @@ torch::Tensor fused_box_bmhrbp_forward(
     return output;
 }
 
+// A robust, reusable warp-level reduction helper for sums
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+    }
+    return val; // The result is in the first lane (0, 32, 64...)
+}
+
+// A warp-level reduction helper for max
+__device__ __forceinline__ float warp_reduce_max(float val) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
+    }
+    return val;
+}
+
 template <int HEIGHT, int WIDTH, int C_HIDDEN, int N_HEADS>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK, 4) pos_mlp_multi_head_bias_backward_kernel(
+__global__ void __launch_bounds__(256, 4) pos_mlp_multi_head_bias_backward_kernel(
     const float* __restrict__ mlp_weights,
     const float* __restrict__ pos,
     const float* __restrict__ grad_output,
     int B,
     float* __restrict__ grad_weights
 ) {
-
-    int b = blockIdx.x;
     int tid = threadIdx.x;
+    int b = blockIdx.x;
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+
+    // Use a warp-based stride for the main loop to ensure warp coherence.
+    int warps_per_block = blockDim.x / 32;
 
     constexpr int grad_size = 3 * C_HIDDEN + C_HIDDEN * N_HEADS + N_HEADS;
 
+    // Shared memory will be used for two things:
+    // 1. Caching the weights.
+    // 2. A final, block-wide reduction of gradients.
     extern __shared__ float s_mem[];
-    // Use shared memory for weights and for gradient reduction
     float* s_weights = s_mem;
-    float* s_grad = s_mem + grad_size;
+    float* s_grad_reduction = s_mem + grad_size;
 
-    // Private, register-based array for gradient accumulation is larger.
-    float p_grad[grad_size];
-    for (int i = 0; i < grad_size; ++i) {
-        p_grad[i] = 0.0f;
-    }
-
-    // Cooperatively load mlp_weights into shared memory and zero out the shared gradient accumulator
+    // --- STAGE 1: Load weights into shared memory ---
     for (int idx = tid; idx < grad_size; idx += blockDim.x) {
         s_weights[idx] = mlp_weights[b * grad_size + idx];
-        s_grad[idx] = 0.0f;
     }
-    __syncthreads();
+    __syncthreads(); // Ensure weights are loaded before proceeding.
 
-    // Define pointers for easier access to weights in shared memory
     const float* s_w1 = s_weights;
     const float* s_b1 = s_weights + 2 * C_HIDDEN;
     const float* s_w2 = s_weights + 3 * C_HIDDEN;
-
+    
+    // --- STAGE 2: Main computation loop with private register accumulation ---
     const float cx = pos[b * 4 + 0];
     const float cy = pos[b * 4 + 1];
     const float half_w = fmaxf(pos[b * 4 + 2] * 0.5f, 1e-6f);
     const float half_h = fmaxf(pos[b * 4 + 3] * 0.5f, 1e-6f);
-
     const float* grad_out_b = &grad_output[b * N_HEADS * HEIGHT * WIDTH];
 
-    // Each thread block processes all spatial positions for one batch item
-    for (int idx = tid; idx < HEIGHT * WIDTH; idx += blockDim.x) {
-        int i = idx / WIDTH;
-        int j = idx % WIDTH;
+    // Each thread accumulates its own portion of gradients into private registers. NO SPILLING.
+    float p_grad_w1_x = 0.0f;
+    float p_grad_w1_y = 0.0f;
+    float p_grad_b1 = 0.0f;
+    float p_grad_w2[N_HEADS] = {0.0f};
+    float p_grad_b2[N_HEADS] = {0.0f};
 
-        float rel_x = ((((float)j) / (float)(WIDTH - 1)) - cx) / half_w;
-        float rel_y = ((((float)i) / (float)(HEIGHT - 1)) - cy) / half_h;
+    // warp-based loop: An entire warp processes one 'idx' at a time.
+    for (int idx = warp_id; idx < HEIGHT * WIDTH; idx += warps_per_block) {
+        // Since C_HIDDEN (16) < warp_size (32), we only need a subset of lanes.
+        // But the reduction math is simpler if we have all threads participate and zero-out unused lanes.
+        
+        int k = lane_id;
 
-        float x[C_HIDDEN]; // Input to softmax
-        float s[C_HIDDEN]; // Output of softmax
+        float rel_x = ((((float)(idx % WIDTH)) / (float)(WIDTH - 1)) - cx) / half_w;
+        float rel_y = ((((float)(idx / WIDTH)) / (float)(HEIGHT - 1)) - cy) / half_h;
 
-        // First MLP layer
-        float max_x = -FLT_MAX;
-        for (int k = 0; k < C_HIDDEN; k++) {
-            x[k] = rel_x * s_w1[2 * k] + rel_y * s_w1[2 * k + 1] + s_b1[k];
-            if (x[k] > max_x) max_x = x[k];
-        }
+        // --- Recompute activations using warp-level primitives ---
+        // Load x_k only if the lane is active for the computation.
+        float x_k = (k < C_HIDDEN) ? (rel_x * s_w1[2 * k] + rel_y * s_w1[2 * k + 1] + s_b1[k]) : -FLT_MAX;
+        
+        float max_x_val = warp_reduce_max(x_k);
+        float max_x = __shfl_sync(0xFFFFFFFF, max_x_val, 0);
 
-        // Softmax activation
-        float sum_exp = 0.0f;
-        for (int k = 0; k < C_HIDDEN; k++) {
-            s[k] = __expf(x[k] - max_x);
-            sum_exp += s[k];
-        }
-        float inv_sum = 1.0f / sum_exp;
-        for (int k = 0; k < C_HIDDEN; k++) {
-            s[k] *= inv_sum;
-        }
+        float s_k_unnormalized = (k < C_HIDDEN) ? __expf(x_k - max_x) : 0.0f;
+        float sum_exp_val = warp_reduce_sum(s_k_unnormalized);
+        float sum_exp = __shfl_sync(0xFFFFFFFF, sum_exp_val, 0);
+        float s_k = s_k_unnormalized / sum_exp;
+        
+        float dL_dx_k = 0.0f;
+        float dL_doutput_hij = grad_out_b[idx];
 
-        // Gradient w.r.t. softmax input (dL/dx), must be accumulated over all heads
-        float dL_dx[C_HIDDEN];
-        for(int k=0; k<C_HIDDEN; ++k) dL_dx[k] = 0.0f;
-
-        // Loop over heads to compute gradients
         for (int h = 0; h < N_HEADS; ++h) {
-            float dL_doutput_hij = grad_out_b[h * HEIGHT * WIDTH + idx];
-
-            // Gradient for bias b2
-            p_grad[3 * C_HIDDEN + C_HIDDEN * N_HEADS + h] += dL_doutput_hij;
-
-            // Recompute (output_h - b2_h) for the dL/dx calculation
-            float output_h_minus_b2_h = 0.0f;
-            for (int k = 0; k < C_HIDDEN; k++) {
-                output_h_minus_b2_h += s[k] * s_w2[k * N_HEADS + h];
+            float dL_doutput_hij_h = grad_out_b[h * HEIGHT * WIDTH + idx];
+            
+            if (lane_id == 0) {
+                p_grad_b2[h] += dL_doutput_hij_h;
             }
 
-            for (int k = 0; k < C_HIDDEN; k++) {
-                // Gradient for weights w2
-                p_grad[3 * C_HIDDEN + k * N_HEADS + h] += dL_doutput_hij * s[k];
+            float s_k_times_w2_kh = (k < C_HIDDEN) ? (s_k * s_w2[k * N_HEADS + h]) : 0.0f;
+            float output_h_val = warp_reduce_sum(s_k_times_w2_kh);
+            float output_h = __shfl_sync(0xFFFFFFFF, output_h_val, 0);
 
-                // Accumulate gradient w.r.t. softmax input for head h
-                dL_dx[k] += dL_doutput_hij * s[k] * (s_w2[k * N_HEADS + h] - output_h_minus_b2_h);
+            if (k < C_HIDDEN) {
+                p_grad_w2[h] += dL_doutput_hij_h * s_k;
+                dL_dx_k += dL_doutput_hij_h * s_k * (s_w2[k * N_HEADS + h] - output_h);
             }
         }
-
-        // Use the final dL/dx (summed over all heads) to calculate gradients for the first layer
-        for (int k = 0; k < C_HIDDEN; k++) {
-            p_grad[2 * k]               += dL_dx[k] * rel_x; // grad w1_x
-            p_grad[2 * k + 1]           += dL_dx[k] * rel_y; // grad w1_y
-            p_grad[2 * C_HIDDEN + k]    += dL_dx[k];       // grad b1
+        
+        if (k < C_HIDDEN) {
+            p_grad_w1_x += dL_dx_k * rel_x;
+            p_grad_w1_y += dL_dx_k * rel_y;
+            p_grad_b1 += dL_dx_k;
         }
     }
 
+    // --- STAGE 3: THE CORRECTED Block-wide Reduction ---
+    for (int i = tid; i < grad_size; i += blockDim.x) { s_grad_reduction[i] = 0.0f; }
     __syncthreads();
 
-    // Reduction of private gradients into shared memory, same logic as before
-    for (int i = 0; i < grad_size; ++i) {
-        float val = p_grad[i];
-
-        // Perform a warp-level reduction using shuffle instructions.
-        for (int offset = 16; offset > 0; offset /= 2) {
-            val += __shfl_down_sync(0xFFFFFFFF, val, offset);
-        }
-        
-        if ((tid % 32) == 0) {
-            atomicAdd(&s_grad[i], val);
+    int k = lane_id;
+    if (k < C_HIDDEN) {
+        atomicAdd(&s_grad_reduction[2 * k], p_grad_w1_x);
+        atomicAdd(&s_grad_reduction[2 * k + 1], p_grad_w1_y);
+        atomicAdd(&s_grad_reduction[2 * C_HIDDEN + k], p_grad_b1);
+        for (int h = 0; h < N_HEADS; ++h) {
+            atomicAdd(&s_grad_reduction[3 * C_HIDDEN + k * N_HEADS + h], p_grad_w2[h]);
         }
     }
     
+    // Now reduce b2: each thread has a partial sum that needs to be fully reduced.
+    for (int h = 0; h < N_HEADS; ++h) {
+        atomicAdd(&s_grad_reduction[3 * C_HIDDEN + C_HIDDEN * N_HEADS + h], p_grad_b2[h]);
+    }
     __syncthreads();
 
-    // Write final reduced gradients from shared memory to global memory
+    // --- STAGE 4: Final write to Global Memory (Unchanged) ---
     for (int idx = tid; idx < grad_size; idx += blockDim.x) {
-        grad_weights[b * grad_size + idx] = s_grad[idx];
+        grad_weights[b * grad_size + idx] = s_grad_reduction[idx];
     }
 }
 
@@ -359,10 +368,13 @@ torch::Tensor fused_box_bmhrbp_backward(
 
     auto grad_weights = torch::zeros_like(mlp_weights);
     int grad_size = 3 * c_hidden + c_hidden * n_heads + n_heads;
-    size_t shared_mem_size = 2 * grad_size * sizeof(float);
 
+    const int THREADS_PER_BLOCK = 256;
+    size_t shared_mem_size = (grad_size + grad_size) * sizeof(float);
+    
     // Templated kernel launcher
     auto launch_kernel = [&](auto... Dims) {
+        // Make sure to call the new kernel!
         pos_mlp_multi_head_bias_backward_kernel<decltype(Dims)::value...><<<B, THREADS_PER_BLOCK, shared_mem_size>>>(
             mlp_weights.data_ptr<float>(),
             pos.data_ptr<float>(),
