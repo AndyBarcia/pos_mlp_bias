@@ -9,7 +9,7 @@
 #include "utils.h"
 
 const int THREADS_PER_BLOCK_FORWARD = 512;
-//const int THREADS_PER_BLOCK = 256;
+const int THREADS_PER_BLOCK_BACKWARD = 1024;
 
 template <int HEIGHT, int WIDTH, int C_HIDDEN, int N_HEADS>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK_FORWARD, 2) pos_mlp_multi_head_bias_forward_kernel(
@@ -230,102 +230,123 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
     return val;
 }
 
-template <int HEIGHT, int WIDTH, int C_HIDDEN, int N_HEADS, int TILE_H, int TILE_W>
-__global__ void tiled_parallel_grad_kernel(
+template <int HEIGHT, int WIDTH, int C_HIDDEN, int N_HEADS>
+__global__ void __launch_bounds__(THREADS_PER_BLOCK_BACKWARD, 1) tiled_parallel_grad_kernel_atomic(
     const float* __restrict__ mlp_weights,
     const float* __restrict__ pos,
     const float* __restrict__ grad_output,
     int B,
+    int num_blocks_per_batch,
     float* __restrict__ intermediate_grad_weights
 ) {
-    // Each block computes a tile. Grid is over (B, H/TILE_H, W/TILE_W)
-    int b = blockIdx.x;
-    
-    // 1D threadIdx mapped to 2D for tile processing
-    int tx = threadIdx.x % TILE_W;
-    int ty = threadIdx.x / TILE_W;
-
-    // Global (h, w) coordinates for this thread
-    int w = blockIdx.z * TILE_W + tx;
-    int h = blockIdx.y * TILE_H + ty;
-
+    // --- 1. Shared Memory and Indexing ---
     constexpr int grad_size = 3 * C_HIDDEN + C_HIDDEN * N_HEADS + N_HEADS;
-    extern __shared__ float s_weights[];
+    extern __shared__ float s_mem[];
+    float* s_weights = s_mem;
+    float* s_final_grad = s_mem + grad_size;
 
-    // --- STAGE 1: Load weights into shared memory (once per block) ---
-    // All threads in the block cooperate to load the weights.
-    for (int i = threadIdx.x; i < grad_size; i += blockDim.x) {
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+
+    // --- 2. Cooperative Loading & Initialization ---
+    const int b = blockIdx.x / num_blocks_per_batch;
+    for (int i = tid; i < grad_size; i += blockDim.x) {
         s_weights[i] = mlp_weights[b * grad_size + i];
+        s_final_grad[i] = 0.0f; // Initialize shared gradient array to zero
     }
     __syncthreads();
 
-    // --- STAGE 2: Main computation per-thread ---
-    // Boundary check: ensure the thread is within the valid HxW grid
-    if (h < HEIGHT && w < WIDTH) {
-        const float* s_w1 = s_weights;
-        const float* s_b1 = s_weights + 2 * C_HIDDEN;
-        const float* s_w2 = s_weights + 3 * C_HIDDEN;
+    const float* s_w1 = s_weights;
+    const float* s_b1 = s_weights + 2 * C_HIDDEN;
+    const float* s_w2 = s_weights + 3 * C_HIDDEN;
+
+    // --- 3. COALESCED Gradient Computation ---
+    constexpr int pixels_per_tile = THREADS_PER_BLOCK_BACKWARD / N_HEADS; // Each block processes a tile of 128 pixels
+    const int h = tid / pixels_per_tile;
+    const int pixel_in_tile_idx = tid % pixels_per_tile;
+
+    const int block_group_id = blockIdx.x % num_blocks_per_batch;
+    const int spatial_idx = block_group_id * pixels_per_tile + pixel_in_tile_idx;
+
+    if (spatial_idx < HEIGHT * WIDTH) {
+        // --- Recompute forward pass for this thread's (pixel, head) pair ---
+        const int i_coord = spatial_idx / WIDTH;
+        const int j_coord = spatial_idx % WIDTH;
+        
+        const float i_norm = ((float) i_coord) / (float) (HEIGHT - 1);
+        const float j_norm = ((float) j_coord) / (float) (WIDTH - 1);
 
         const float cx = pos[b * 4 + 0];
         const float cy = pos[b * 4 + 1];
         const float half_w = fmaxf(pos[b * 4 + 2] * 0.5f, 1e-6f);
         const float half_h = fmaxf(pos[b * 4 + 3] * 0.5f, 1e-6f);
 
-        int idx = h * WIDTH + w;
-        float rel_x = ((((float)w) / (float)(WIDTH - 1)) - cx) / half_w;
-        float rel_y = ((((float)h) / (float)(HEIGHT - 1)) - cy) / half_h;
+        const float rel_x = (j_norm - cx) / half_w;
+        const float rel_y = (i_norm - cy) / half_h;
         
-        // --- Activation recomputation (warp-parallel) ---
-        // This entire section is now executed by each thread for its assigned (h,w)
-        int k = threadIdx.x % 32; // lane_id
-        
-        // Note: Using a single warp's lanes for this part means we need __shfl_sync,
-        // but the calculation is independent for each thread's (h,w).
-        // This logic remains fundamentally the same, just executed by many more threads.
-        float x_k = (k < C_HIDDEN) ? (rel_x * s_w1[2 * k] + rel_y * s_w1[2 * k + 1] + s_b1[k]) : -FLT_MAX;
-        float max_x_val = warp_reduce_max(x_k);
-        float max_x = __shfl_sync(0xFFFFFFFF, max_x_val, 0);
-
-        float s_k_unnormalized = (k < C_HIDDEN) ? __expf(x_k - max_x) : 0.0f;
-        float sum_exp_val = warp_reduce_sum(s_k_unnormalized);
-        float sum_exp = __shfl_sync(0xFFFFFFFF, sum_exp_val, 0);
-        float s_k = s_k_unnormalized / (sum_exp + 1e-6f);
-
-        float dL_dx_k = 0.0f;
-        for (int head = 0; head < N_HEADS; ++head) {
-            float dL_doutput_hij_h = grad_output[(b * N_HEADS + head) * HEIGHT * WIDTH + idx];
-            float s_k_times_w2_kh = (k < C_HIDDEN) ? (s_k * s_w2[k * N_HEADS + head]) : 0.0f;
-            float output_h_val = warp_reduce_sum(s_k_times_w2_kh);
-            float output_h = __shfl_sync(0xFFFFFFFF, output_h_val, 0);
-            if (k < C_HIDDEN) {
-                dL_dx_k += dL_doutput_hij_h * s_k * (s_w2[k * N_HEADS + head] - output_h);
+        float s[C_HIDDEN];
+        // Recompute softmax output 's' for this pixel (same as before)
+        {
+            //float x[C_HIDDEN];
+            float max_x = -FLT_MAX;
+            for (int k = 0; k < C_HIDDEN; k++) {
+                s[k] = rel_x * s_w1[2 * k] + rel_y * s_w1[2 * k + 1] + s_b1[k];
+                if (s[k] > max_x) max_x = s[k];
+            }
+            float sum_exp = 0.0f;
+            for (int k = 0; k < C_HIDDEN; k++) {
+                s[k] = __expf(s[k] - max_x);
+                sum_exp += s[k];
+            }
+            const float inv_sum = 1.0f / sum_exp;
+            for (int k = 0; k < C_HIDDEN; k++) {
+                s[k] *= inv_sum;
             }
         }
+
+        const float dL_doutput = grad_output[b * N_HEADS * HEIGHT * WIDTH + h * HEIGHT * WIDTH + spatial_idx];
+        
+        float output_h_minus_b2_h = 0.0f;
+        for (int k = 0; k < C_HIDDEN; k++) {
+            output_h_minus_b2_h += s[k] * s_w2[k * N_HEADS + h];
+        }
+
+        // --- 4. IMMEDIATE REDUCTION to remove register pressure ---
+        // For each component k, calculate its gradient contribution, reduce, and add to shared memory.
+        for (int k = 0; k < C_HIDDEN; k++) {
+            // --- Grads for w1 and b1 ---
+            const float dL_dx_k_contrib = dL_doutput * s[k] * (s_w2[k * N_HEADS + h] - output_h_minus_b2_h);
+            
+            float grad_w1x = dL_dx_k_contrib * rel_x;
+            float reduced_val = warp_reduce_sum(grad_w1x);
+            if (lane_id == 0) atomicAdd(&s_final_grad[2 * k], reduced_val);
+
+            float grad_w1y = dL_dx_k_contrib * rel_y;
+            reduced_val = warp_reduce_sum(grad_w1y);
+            if (lane_id == 0) atomicAdd(&s_final_grad[2 * k + 1], reduced_val);
+
+            float grad_b1k = dL_dx_k_contrib;
+            reduced_val = warp_reduce_sum(grad_b1k);
+            if (lane_id == 0) atomicAdd(&s_final_grad[2 * C_HIDDEN + k], reduced_val);
+
+            // --- Grad for w2 ---
+            float grad_w2kh = dL_doutput * s[k];
+            reduced_val = warp_reduce_sum(grad_w2kh);
+            if (lane_id == 0) atomicAdd(&s_final_grad[3 * C_HIDDEN + k * N_HEADS + h], reduced_val);
+        }
+
+        // --- Grad for b2 (after the main loop) ---
+        float reduced_val = warp_reduce_sum(dL_doutput);
+        if (lane_id == 0) atomicAdd(&s_final_grad[3 * C_HIDDEN + C_HIDDEN * N_HEADS + h], reduced_val);
+    }
     
-        // --- STAGE 3: Write per-location gradients to intermediate buffer ---
-        // Each thread writes to its own unique location, no race conditions.
-        // We only need one thread to write the final gradient for each of the C_HIDDEN components.
-        // We can do this with a warp shuffle.
-        if (k == 0) { // Only lane 0 of each warp does the writing
-            size_t offset = (size_t)b * HEIGHT * WIDTH * grad_size + (size_t)idx * grad_size;
-            float* grad_out_ptr = intermediate_grad_weights + offset;
+    __syncthreads();
 
-            for (int ck = 0; ck < C_HIDDEN; ++ck) {
-                float dL_dx_k_at_ck = __shfl_sync(0xFFFFFFFF, dL_dx_k, ck);
-                grad_out_ptr[2 * ck] = dL_dx_k_at_ck * rel_x;
-                grad_out_ptr[2 * ck + 1] = dL_dx_k_at_ck * rel_y;
-                grad_out_ptr[2 * C_HIDDEN + ck] = dL_dx_k_at_ck;
-            }
-
-            for (int head = 0; head < N_HEADS; ++head) {
-                float dL_doutput_hij_h = grad_output[(b * N_HEADS + head) * HEIGHT * WIDTH + idx];
-                grad_out_ptr[3 * C_HIDDEN + C_HIDDEN * N_HEADS + head] = dL_doutput_hij_h;
-                for (int ck = 0; ck < C_HIDDEN; ++ck) {
-                    float s_k_at_ck = __shfl_sync(0xFFFFFFFF, s_k, ck);
-                    grad_out_ptr[3 * C_HIDDEN + ck * N_HEADS + head] = dL_doutput_hij_h * s_k_at_ck;
-                }
-            }
-        }
+    // --- 5. Final Coalesced Write to Global Memory ---
+    const int out_base_idx = b * num_blocks_per_batch * grad_size + block_group_id * grad_size;
+    for (int i = tid; i < grad_size; i += blockDim.x) {
+        intermediate_grad_weights[out_base_idx + i] = s_final_grad[i];
     }
 }
 
@@ -344,34 +365,25 @@ torch::Tensor fused_box_bmhrbp_backward(
     const int height = grad_out.size(2);
     const int width = grad_out.size(3);
 
-    int grad_size = 3 * c_hidden + c_hidden * n_heads + n_heads;
+    const int grad_size = 3 * c_hidden + c_hidden * n_heads + n_heads;
+    const int pixels_per_block_tile = THREADS_PER_BLOCK_BACKWARD / n_heads; // Each block processes a tile of 128 pixels
+    const int num_blocks_per_batch = (height * width + pixels_per_block_tile - 1) / pixels_per_block_tile;
 
-    // Allocate the intermediate buffer for the map-reduce operation
-    auto intermediate_opts = grad_out.options().dtype(torch::kFloat32);
-    auto intermediate_grad = torch::empty({B, height, width, grad_size}, intermediate_opts);
+    // --- STEP 1: Allocate intermediate tensor for block-level results ---
+    auto intermediate_grad = torch::zeros({B, num_blocks_per_batch, grad_size}, mlp_weights.options());
     
-    // --- Define Tile Dimensions ---
-    // A 16x16 tile gives a block size of 256, a good starting point for tuning. 94ms
-    constexpr int TILE_H = 32;
-    constexpr int TILE_W = 32;
-    constexpr int THREADS_PER_BLOCK = TILE_H * TILE_W;
+    // --- STEP 2: Launch the optimized backward kernel ---
+    const int grid_size = B * num_blocks_per_batch;
+    // Shared memory for weights AND the final reduced gradient for the block
+    const size_t shared_mem_size = (grad_size + grad_size) * sizeof(float);
 
-    // Templated kernel launcher
     auto launch_kernel = [&](auto... Dims) {
-        // Calculate grid dimensions to cover the entire HxW space with tiles
-        dim3 gridDim(
-            B,
-            (height + TILE_H - 1) / TILE_H,
-            (width + TILE_W - 1) / TILE_W
-        );
-        dim3 blockDim(THREADS_PER_BLOCK);
-        size_t shared_mem_size = grad_size * sizeof(float);
-
-        tiled_parallel_grad_kernel<decltype(Dims)::value..., TILE_H, TILE_W><<<gridDim, blockDim, shared_mem_size>>>(
+        tiled_parallel_grad_kernel_atomic<decltype(Dims)::value...><<<grid_size, THREADS_PER_BLOCK_BACKWARD, shared_mem_size>>>(
             mlp_weights.data_ptr<float>(),
             pos.data_ptr<float>(),
             grad_out.data_ptr<float>(),
             B,
+            num_blocks_per_batch,
             intermediate_grad.data_ptr<float>()
         );
     };
@@ -398,9 +410,7 @@ torch::Tensor fused_box_bmhrbp_backward(
     CHECK_CUDA_ERROR(cudaPeekAtLastError());
 
     // --- STEP 3: Use native PyTorch to perform the final reduction ---
-    // Sum over the H (dim 1) and W (dim 2) dimensions.
-    // The result will have the shape (B, grad_size), which matches mlp_weights.
-    auto grad_weights = intermediate_grad.sum({1, 2});
+    auto grad_weights = intermediate_grad.sum({1});
 
     return grad_weights;
 }
