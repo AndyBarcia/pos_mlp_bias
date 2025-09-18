@@ -9,7 +9,11 @@
 #include "utils.h"
 
 const int THREADS_PER_BLOCK_FORWARD = 512;
-const int THREADS_PER_BLOCK_BACKWARD = 1024;
+const int THREADS_PER_BLOCK_BACKWARD = 512; 
+// 1024 -> 293ms
+// 512 -> 155ms
+// 256 -> 
+// 128 -> 
 
 template <int HEIGHT, int WIDTH, int C_HIDDEN, int N_HEADS>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK_FORWARD, 2) pos_mlp_multi_head_bias_forward_kernel(
@@ -231,122 +235,132 @@ __device__ __forceinline__ float warp_reduce_max(float val) {
 }
 
 template <int HEIGHT, int WIDTH, int C_HIDDEN, int N_HEADS>
-__global__ void __launch_bounds__(THREADS_PER_BLOCK_BACKWARD, 1) tiled_parallel_grad_kernel_atomic(
+__global__ void __launch_bounds__(THREADS_PER_BLOCK_BACKWARD, 1) tiled_gemm_backward_kernel(
     const float* __restrict__ mlp_weights,
     const float* __restrict__ pos,
     const float* __restrict__ grad_output,
-    int B,
-    int num_blocks_per_batch,
-    float* __restrict__ intermediate_grad_weights
+    float* __restrict__ grad_weights // Note: No intermediate tensor
 ) {
-    // --- 1. Shared Memory and Indexing ---
+    // --- 1. KERNEL CONFIG & SHARED MEMORY ---
     constexpr int grad_size = 3 * C_HIDDEN + C_HIDDEN * N_HEADS + N_HEADS;
+    constexpr int SPATIAL_TILE_DIM = THREADS_PER_BLOCK_BACKWARD/N_HEADS; // Each tile processes 128 pixels
+
     extern __shared__ float s_mem[];
     float* s_weights = s_mem;
-    float* s_final_grad = s_mem + grad_size;
+    float* s_grad = s_mem + grad_size;
+    float* s_tile_grad_out = s_grad + grad_size; // N_HEADS x TILE_DIM
+    float* s_tile_s = s_tile_grad_out + N_HEADS * SPATIAL_TILE_DIM; // C_HIDDEN x TILE_DIM
 
+    // --- 2. INITIALIZATION ---
+    // Each block computes the full gradient for one batch item.
+    const int b = blockIdx.x;
     const int tid = threadIdx.x;
-    const int warp_id = tid / 32;
     const int lane_id = tid % 32;
 
-    // --- 2. Cooperative Loading & Initialization ---
-    const int b = blockIdx.x / num_blocks_per_batch;
+    // Cooperatively load weights and zero out the shared gradient accumulator
     for (int i = tid; i < grad_size; i += blockDim.x) {
         s_weights[i] = mlp_weights[b * grad_size + i];
-        s_final_grad[i] = 0.0f; // Initialize shared gradient array to zero
+        s_grad[i] = 0.0f;
     }
     __syncthreads();
 
     const float* s_w1 = s_weights;
     const float* s_b1 = s_weights + 2 * C_HIDDEN;
     const float* s_w2 = s_weights + 3 * C_HIDDEN;
-
-    // --- 3. COALESCED Gradient Computation ---
-    constexpr int pixels_per_tile = THREADS_PER_BLOCK_BACKWARD / N_HEADS; // Each block processes a tile of 128 pixels
-    const int h = tid / pixels_per_tile;
-    const int pixel_in_tile_idx = tid % pixels_per_tile;
-
-    const int block_group_id = blockIdx.x % num_blocks_per_batch;
-    const int spatial_idx = block_group_id * pixels_per_tile + pixel_in_tile_idx;
-
-    if (spatial_idx < HEIGHT * WIDTH) {
-        // --- Recompute forward pass for this thread's (pixel, head) pair ---
-        const int i_coord = spatial_idx / WIDTH;
-        const int j_coord = spatial_idx % WIDTH;
-        
-        const float i_norm = ((float) i_coord) / (float) (HEIGHT - 1);
-        const float j_norm = ((float) j_coord) / (float) (WIDTH - 1);
-
-        const float cx = pos[b * 4 + 0];
-        const float cy = pos[b * 4 + 1];
-        const float half_w = fmaxf(pos[b * 4 + 2] * 0.5f, 1e-6f);
-        const float half_h = fmaxf(pos[b * 4 + 3] * 0.5f, 1e-6f);
-
-        const float rel_x = (j_norm - cx) / half_w;
-        const float rel_y = (i_norm - cy) / half_h;
-        
-        float s[C_HIDDEN];
-        // Recompute softmax output 's' for this pixel (same as before)
-        {
-            //float x[C_HIDDEN];
-            float max_x = -FLT_MAX;
-            for (int k = 0; k < C_HIDDEN; k++) {
-                s[k] = rel_x * s_w1[2 * k] + rel_y * s_w1[2 * k + 1] + s_b1[k];
-                if (s[k] > max_x) max_x = s[k];
-            }
-            float sum_exp = 0.0f;
-            for (int k = 0; k < C_HIDDEN; k++) {
-                s[k] = __expf(s[k] - max_x);
-                sum_exp += s[k];
-            }
-            const float inv_sum = 1.0f / sum_exp;
-            for (int k = 0; k < C_HIDDEN; k++) {
-                s[k] *= inv_sum;
-            }
-        }
-
-        const float dL_doutput = grad_output[b * N_HEADS * HEIGHT * WIDTH + h * HEIGHT * WIDTH + spatial_idx];
-        
-        float output_h_minus_b2_h = 0.0f;
-        for (int k = 0; k < C_HIDDEN; k++) {
-            output_h_minus_b2_h += s[k] * s_w2[k * N_HEADS + h];
-        }
-
-        // --- 4. IMMEDIATE REDUCTION to remove register pressure ---
-        // For each component k, calculate its gradient contribution, reduce, and add to shared memory.
-        for (int k = 0; k < C_HIDDEN; k++) {
-            // --- Grads for w1 and b1 ---
-            const float dL_dx_k_contrib = dL_doutput * s[k] * (s_w2[k * N_HEADS + h] - output_h_minus_b2_h);
-            
-            float grad_w1x = dL_dx_k_contrib * rel_x;
-            float reduced_val = warp_reduce_sum(grad_w1x);
-            if (lane_id == 0) atomicAdd(&s_final_grad[2 * k], reduced_val);
-
-            float grad_w1y = dL_dx_k_contrib * rel_y;
-            reduced_val = warp_reduce_sum(grad_w1y);
-            if (lane_id == 0) atomicAdd(&s_final_grad[2 * k + 1], reduced_val);
-
-            float grad_b1k = dL_dx_k_contrib;
-            reduced_val = warp_reduce_sum(grad_b1k);
-            if (lane_id == 0) atomicAdd(&s_final_grad[2 * C_HIDDEN + k], reduced_val);
-
-            // --- Grad for w2 ---
-            float grad_w2kh = dL_doutput * s[k];
-            reduced_val = warp_reduce_sum(grad_w2kh);
-            if (lane_id == 0) atomicAdd(&s_final_grad[3 * C_HIDDEN + k * N_HEADS + h], reduced_val);
-        }
-
-        // --- Grad for b2 (after the main loop) ---
-        float reduced_val = warp_reduce_sum(dL_doutput);
-        if (lane_id == 0) atomicAdd(&s_final_grad[3 * C_HIDDEN + C_HIDDEN * N_HEADS + h], reduced_val);
-    }
     
-    __syncthreads();
+    const float cx = pos[b * 4 + 0];
+    const float cy = pos[b * 4 + 1];
+    const float half_w = fmaxf(pos[b * 4 + 2] * 0.5f, 1e-6f);
+    const float half_h = fmaxf(pos[b * 4 + 3] * 0.5f, 1e-6f);
 
-    // --- 5. Final Coalesced Write to Global Memory ---
-    const int out_base_idx = b * num_blocks_per_batch * grad_size + block_group_id * grad_size;
+    // --- 3. MAIN LOOP OVER SPATIAL TILES ---
+    for (int spatial_base = 0; spatial_base < HEIGHT * WIDTH; spatial_base += SPATIAL_TILE_DIM) {
+        
+        // --- 3a. PHASE 1: Load Tile Data into Shared Memory ---
+        // 1024 threads cooperatively load a (N_HEADS x 128) tile of grad_output
+        // and recompute the corresponding (C_HIDDEN x 128) tile of 's' activations.
+        for (int i = tid; i < SPATIAL_TILE_DIM; i += blockDim.x) {
+            const int spatial_idx = spatial_base + i;
+            if (spatial_idx < HEIGHT * WIDTH) {
+                // Load one column of grad_output tile
+                for(int h=0; h < N_HEADS; ++h){
+                    s_tile_grad_out[h * SPATIAL_TILE_DIM + i] = grad_output[b * N_HEADS * HEIGHT * WIDTH + h * HEIGHT * WIDTH + spatial_idx];
+                }
+                
+                // Recompute one column of 's' activation tile
+                const int i_coord = spatial_idx / WIDTH;
+                const int j_coord = spatial_idx % WIDTH;
+                const float rel_x = ((((float)j_coord) / (float)(WIDTH - 1)) - cx) / half_w;
+                const float rel_y = ((((float)i_coord) / (float)(HEIGHT - 1)) - cy) / half_h;
+                
+                float s[C_HIDDEN];
+                {
+                    float x[C_HIDDEN];
+                    float max_x = -FLT_MAX;
+                    for (int k = 0; k < C_HIDDEN; k++) {
+                        x[k] = rel_x * s_w1[2 * k] + rel_y * s_w1[2 * k + 1] + s_b1[k];
+                        if (x[k] > max_x) max_x = x[k];
+                    }
+                    float sum_exp = 0.0f;
+                    for (int k = 0; k < C_HIDDEN; k++) {
+                        s[k] = __expf(x[k] - max_x);
+                        sum_exp += s[k];
+                    }
+                    const float inv_sum = 1.0f / sum_exp;
+                    for (int k = 0; k < C_HIDDEN; k++) {
+                        s[k] *= inv_sum;
+                        s_tile_s[k * SPATIAL_TILE_DIM + i] = s[k];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        // --- 3b. PHASE 2: Compute on Tile and Accumulate Gradient ---
+        // Each thread processes its assigned (head, pixel_in_tile) pair
+        const int h = tid / SPATIAL_TILE_DIM;
+        const int p_idx = tid % SPATIAL_TILE_DIM;
+        const int spatial_idx = spatial_base + p_idx;
+
+        if (spatial_idx < HEIGHT * WIDTH) {
+            const float dL_doutput = s_tile_grad_out[h * SPATIAL_TILE_DIM + p_idx];
+
+            float output_h_minus_b2_h = 0.0f;
+            for (int k = 0; k < C_HIDDEN; k++) {
+                output_h_minus_b2_h += s_tile_s[k * SPATIAL_TILE_DIM + p_idx] * s_w2[k * N_HEADS + h];
+            }
+
+            for (int k = 0; k < C_HIDDEN; k++) {
+                const float s_val = s_tile_s[k * SPATIAL_TILE_DIM + p_idx];
+                const float dL_dx_k_contrib = dL_doutput * s_val * (s_w2[k * N_HEADS + h] - output_h_minus_b2_h);
+                
+                const int i_coord = spatial_idx / WIDTH;
+                const int j_coord = spatial_idx % WIDTH;
+                const float rel_x = ((((float)j_coord) / (float)(WIDTH - 1)) - cx) / half_w;
+                const float rel_y = ((((float)i_coord) / (float)(HEIGHT - 1)) - cy) / half_h;
+                
+                float reduced_val = warp_reduce_sum(dL_dx_k_contrib * rel_x);
+                if (lane_id == 0) atomicAdd(&s_grad[2 * k], reduced_val);
+
+                reduced_val = warp_reduce_sum(dL_dx_k_contrib * rel_y);
+                if (lane_id == 0) atomicAdd(&s_grad[2 * k + 1], reduced_val);
+                
+                reduced_val = warp_reduce_sum(dL_dx_k_contrib);
+                if (lane_id == 0) atomicAdd(&s_grad[2 * C_HIDDEN + k], reduced_val);
+
+                reduced_val = warp_reduce_sum(dL_doutput * s_val);
+                if (lane_id == 0) atomicAdd(&s_grad[3 * C_HIDDEN + k * N_HEADS + h], reduced_val);
+            }
+            float reduced_val = warp_reduce_sum(dL_doutput);
+            if (lane_id == 0) atomicAdd(&s_grad[3 * C_HIDDEN + C_HIDDEN * N_HEADS + h], reduced_val);
+        }
+        __syncthreads();
+    }
+
+    // --- 4. FINAL WRITE ---
+    // All threads in the block help write the final gradient to global memory.
     for (int i = tid; i < grad_size; i += blockDim.x) {
-        intermediate_grad_weights[out_base_idx + i] = s_final_grad[i];
+        grad_weights[b * grad_size + i] = s_grad[i];
     }
 }
 
@@ -366,25 +380,27 @@ torch::Tensor fused_box_bmhrbp_backward(
     const int width = grad_out.size(3);
 
     const int grad_size = 3 * c_hidden + c_hidden * n_heads + n_heads;
-    const int pixels_per_block_tile = THREADS_PER_BLOCK_BACKWARD / n_heads; // Each block processes a tile of 128 pixels
-    const int num_blocks_per_batch = (height * width + pixels_per_block_tile - 1) / pixels_per_block_tile;
-
-    // --- STEP 1: Allocate intermediate tensor for block-level results ---
-    auto intermediate_grad = torch::zeros({B, num_blocks_per_batch, grad_size}, mlp_weights.options());
     
-    // --- STEP 2: Launch the optimized backward kernel ---
-    const int grid_size = B * num_blocks_per_batch;
-    // Shared memory for weights AND the final reduced gradient for the block
-    const size_t shared_mem_size = (grad_size + grad_size) * sizeof(float);
+    // Allocate final output tensor directly. No intermediate tensor needed.
+    auto grad_weights = torch::empty({B, grad_size}, mlp_weights.options());
+
+    // Grid is just B blocks, one for each batch item.
+    const int grid_size = B;
+    
+    constexpr int SPATIAL_TILE_DIM = THREADS_PER_BLOCK_BACKWARD/8; // Each tile processes 128 pixels
+    const size_t shared_mem_size = (
+        grad_size + // s_grad
+        grad_size + // s_weights
+        n_heads * SPATIAL_TILE_DIM + // s_tile_grad_out
+        c_hidden * SPATIAL_TILE_DIM  // s_tile_s
+    ) * sizeof(float);
 
     auto launch_kernel = [&](auto... Dims) {
-        tiled_parallel_grad_kernel_atomic<decltype(Dims)::value...><<<grid_size, THREADS_PER_BLOCK_BACKWARD, shared_mem_size>>>(
+        tiled_gemm_backward_kernel<decltype(Dims)::value...><<<grid_size, THREADS_PER_BLOCK_BACKWARD, shared_mem_size>>>(
             mlp_weights.data_ptr<float>(),
             pos.data_ptr<float>(),
             grad_out.data_ptr<float>(),
-            B,
-            num_blocks_per_batch,
-            intermediate_grad.data_ptr<float>()
+            grad_weights.data_ptr<float>()
         );
     };
 
@@ -405,12 +421,9 @@ torch::Tensor fused_box_bmhrbp_backward(
 
     const auto runtime_dims = std::make_tuple(height, width, c_hidden, n_heads);
 
-    // Call the generalized dispatcher.
     dispatch_kernel(launch_kernel, runtime_dims, supported_dims);
     CHECK_CUDA_ERROR(cudaPeekAtLastError());
 
-    // --- STEP 3: Use native PyTorch to perform the final reduction ---
-    auto grad_weights = intermediate_grad.sum({1});
-
+    // The final reduction is no longer needed, the kernel does it all.
     return grad_weights;
 }
