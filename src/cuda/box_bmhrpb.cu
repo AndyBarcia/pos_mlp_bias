@@ -10,10 +10,6 @@
 
 const int THREADS_PER_BLOCK_FORWARD = 512;
 const int THREADS_PER_BLOCK_BACKWARD = 512; 
-// 1024 -> 293ms
-// 512 -> 155ms
-// 256 -> 
-// 128 -> 
 
 template <int HEIGHT, int WIDTH, int C_HIDDEN, int N_HEADS>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK_FORWARD, 2) pos_mlp_multi_head_bias_forward_kernel(
