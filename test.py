@@ -1,7 +1,11 @@
 import unittest
 import torch
 
-from functions import PosMLP, PosMLPAttention, PairPosMLP, PosMLPSelfAttention
+from functions import (
+    PosMLP, PosMLPAttention, 
+    PosGaussian, PosGaussianAttention,
+    PairPosMLP, PosMLPSelfAttention
+)
 
 
 class TestPosMLP(unittest.TestCase):
@@ -42,6 +46,37 @@ class TestPosMLP(unittest.TestCase):
         output_python = model(pos, size=16, queries=queries, implementation='python')
         self.assertEqual(output_python.shape, (10, 16, 16))
 
+class TestPosGaussian(unittest.TestCase):
+    def test_batched(self):
+        model = PosGaussian(dim=32, n_heads=4).to('cuda')
+        pos = torch.rand(10, 4, device='cuda')
+        queries = torch.rand(10, 32, device='cuda')
+        output = model(pos, size=16, queries=queries)
+        self.assertEqual(output.shape, (10, 4, 16, 16))
+
+    def test_dynamic_kernel(self):
+        model = PosGaussian(dim=32, n_heads=4).to('cuda')
+        pos = torch.rand(10, 4, device='cuda')
+        queries = torch.rand(10, 32, device='cuda')
+        output = model(pos, size=(13,12), queries=queries)
+        self.assertEqual(output.shape, (10, 4, 13, 12))
+
+    def test_multi_dim_input_batched(self):
+        model = PosGaussian(dim=32, n_heads=4).to('cuda')
+        pos = torch.rand(2, 5, 4, device='cuda')
+        queries = torch.rand(2, 5, 32, device='cuda')
+        output = model(pos, size=(16, 16), queries=queries)
+        self.assertEqual(output.shape, (2, 5, 4, 16, 16))
+
+    def test_implementations(self):
+        model = PosGaussian(dim=32, n_heads=4).to('cuda')
+        pos = torch.rand(10, 4, device='cuda')
+        queries = torch.rand(10, 32, device='cuda')
+        # Test that both 'cuda' and 'python' code paths execute without error
+        output_cuda = model(pos, size=16, queries=queries, implementation='cuda')
+        self.assertEqual(output_cuda.shape, (10, 4, 16, 16))
+        output_python = model(pos, size=16, queries=queries, implementation='python')
+        self.assertEqual(output_python.shape, (10, 4, 16, 16))
 
 class TestPairPosMLP(unittest.TestCase):
     def test_non_batched(self):
@@ -86,7 +121,7 @@ class TestPosMLPAttention(unittest.TestCase):
         queries = torch.rand(B, Q, dim, device='cuda')
         memory = torch.rand(B, H, W, dim, device='cuda')
         pos = torch.rand(B, Q, 4, device='cuda')
-        output = model(queries, memory, pos)
+        output, _ = model(queries, memory, pos)
         self.assertEqual(output.shape, (B, Q, dim))
 
     def test_dynamic_forward(self):
@@ -95,7 +130,7 @@ class TestPosMLPAttention(unittest.TestCase):
         queries = torch.rand(B, Q, dim, device='cuda')
         memory = torch.rand(B, H, W, dim, device='cuda')
         pos = torch.rand(B, Q, 4, device='cuda')
-        output = model(queries, memory, pos)
+        output, _ = model(queries, memory, pos)
         self.assertEqual(output.shape, (B, Q, dim))
 
     def test_multi_dim_input(self):
@@ -104,7 +139,7 @@ class TestPosMLPAttention(unittest.TestCase):
         queries = torch.rand(B, N, Q, dim, device='cuda')
         memory = torch.rand(B, N, H, W, dim, device='cuda')
         pos = torch.rand(B, N, Q, 4, device='cuda')
-        output = model(queries, memory, pos)
+        output, _ = model(queries, memory, pos)
         self.assertEqual(output.shape, (B, N, Q, dim))
 
     def test_different_k_dim(self):
@@ -113,7 +148,7 @@ class TestPosMLPAttention(unittest.TestCase):
         queries = torch.rand(B, Q, dim, device='cuda')
         memory = torch.rand(B, H, W, k_dim, device='cuda')
         pos = torch.rand(B, Q, 4, device='cuda')
-        output = model(queries, memory, pos)
+        output, _ = model(queries, memory, pos)
         self.assertEqual(output.shape, (B, Q, dim))
     
     def test_pos_embd(self):
@@ -124,7 +159,7 @@ class TestPosMLPAttention(unittest.TestCase):
         pos = torch.rand(B, Q, 4, device='cuda')
         queries_pos_emb = torch.rand(B, Q, dim, device='cuda')
         memory_pos_emb = torch.rand(B, H, W, dim, device='cuda')
-        output = model(queries, memory, pos, query_pos_emb=queries_pos_emb, memory_pos_emb=memory_pos_emb)
+        output, _ = model(queries, memory, pos, query_pos_emb=queries_pos_emb, memory_pos_emb=memory_pos_emb)
         self.assertEqual(output.shape, (B, Q, dim))
 
     def test_return_attn_logits(self):
@@ -144,8 +179,47 @@ class TestPosMLPAttention(unittest.TestCase):
         memory = torch.rand(B, H, W, dim, device='cuda')
         pos = torch.rand(B, Q, 4, device='cuda')
         attn_mask = torch.randint(0, 2, (B*n_heads, Q, H*W), dtype=torch.bool, device='cuda')
-        output = model(queries, memory, pos, attn_mask=attn_mask)
+        output, _ = model(queries, memory, pos, attn_mask=attn_mask)
         self.assertEqual(output.shape, (B, Q, dim))
+
+
+class TestPosGaussianAttention(unittest.TestCase):
+    def test_forward(self):
+        dim, n_heads, Q, H, W, B = 32, 4, 10, 16, 16, 4
+        model = PosGaussianAttention(dim=dim, n_heads=n_heads).to('cuda')
+        queries = torch.rand(B, Q, dim, device='cuda')
+        memory = torch.rand(B, H, W, dim, device='cuda')
+        pos = torch.rand(B, Q, 4, device='cuda')
+        output, _ = model(queries, memory, pos)
+        self.assertEqual(output.shape, (B, Q, dim))
+
+    def test_dynamic_forward(self):
+        dim, n_heads, Q, H, W, B = 32, 4, 10, 24, 13, 4
+        model = PosGaussianAttention(dim=dim, n_heads=n_heads).to('cuda')
+        queries = torch.rand(B, Q, dim, device='cuda')
+        memory = torch.rand(B, H, W, dim, device='cuda')
+        pos = torch.rand(B, Q, 4, device='cuda')
+        output, _ = model(queries, memory, pos)
+        self.assertEqual(output.shape, (B, Q, dim))
+
+    def test_multi_dim_input(self):
+        dim, n_heads, Q, H, W, B, N = 32, 4, 10, 16, 16, 4, 3
+        model = PosGaussianAttention(dim=dim, n_heads=n_heads).to('cuda')
+        queries = torch.rand(B, N, Q, dim, device='cuda')
+        memory = torch.rand(B, N, H, W, dim, device='cuda')
+        pos = torch.rand(B, N, Q, 4, device='cuda')
+        output, _ = model(queries, memory, pos)
+        self.assertEqual(output.shape, (B, N, Q, dim))
+
+    def test_different_k_dim(self):
+        dim, k_dim, n_heads, Q, H, W, B = 32, 64, 4, 10, 16, 16, 4
+        model = PosGaussianAttention(dim=dim, k_dim=k_dim,n_heads=n_heads).to('cuda')
+        queries = torch.rand(B, Q, dim, device='cuda')
+        memory = torch.rand(B, H, W, k_dim, device='cuda')
+        pos = torch.rand(B, Q, 4, device='cuda')
+        output, _ = model(queries, memory, pos)
+        self.assertEqual(output.shape, (B, Q, dim))
+
 
 class TestPosMLPSelfAttention(unittest.TestCase):
     def test_forward(self):
@@ -153,7 +227,7 @@ class TestPosMLPSelfAttention(unittest.TestCase):
         model = PosMLPSelfAttention(dim=dim, n_heads=n_heads, implementation="python").to('cuda')
         x = torch.rand(B, Q, dim, device='cuda')
         pos = torch.rand(B, Q, 4, device='cuda')
-        output = model(x, pos)
+        output, _ = model(x, pos)
         self.assertEqual(output.shape, (B, Q, dim))
 
     def test_multi_dim_input(self):
@@ -161,7 +235,7 @@ class TestPosMLPSelfAttention(unittest.TestCase):
         model = PosMLPSelfAttention(dim=dim, n_heads=n_heads, implementation="python").to('cuda')
         x = torch.rand(B, N, Q, dim, device='cuda')
         pos = torch.rand(B, N, Q, 4, device='cuda')
-        output = model(x, pos)
+        output, _ = model(x, pos)
         self.assertEqual(output.shape, (B, N, Q, dim))
     
     def test_pos_embd(self):
@@ -170,7 +244,7 @@ class TestPosMLPSelfAttention(unittest.TestCase):
         x = torch.rand(B, Q, dim, device='cuda')
         pos = torch.rand(B, Q, 4, device='cuda')
         pos_emb = torch.rand(B, Q, dim, device='cuda')
-        output = model(x, pos, pos_emb=pos_emb)
+        output, _ = model(x, pos, pos_emb=pos_emb)
         self.assertEqual(output.shape, (B, Q, dim))
 
 if __name__ == '__main__':
