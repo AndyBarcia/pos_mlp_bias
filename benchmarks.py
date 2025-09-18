@@ -10,6 +10,7 @@ from functions import (
     BoxRPBCUDAFunction, box_rbp_python,
     BoxBRPBCUDAFunction, box_brbp_python,
     BoxBMHRPBCUDAFunction, box_bmhrbp_python,
+    BoxGaussianCUDAFunction, box_gaussian_python,
     BoxPairRPBCUDAFunction, box_pair_rbp_python,
     BoxPairBRPBCUDAFunction, box_pair_brbp_python,
     AttentionCUDAFunction, attn_python,
@@ -221,7 +222,7 @@ def test_box_bmhrbp():
     Nh = 8
 
     input_creators = {
-        "mlp_weights": lambda device, dtype: torch.randn(B, 2 * Ch + Ch + Ch * Nh + Nh, device=device, dtype=dtype),
+        "mlp_weights": lambda device, dtype: torch.randn(B, 2 * Ch + Ch + Ch * Nh + Nh, device=device, dtype=dtype) * 0.0,
         "pos": lambda device, dtype: torch.cat([
             torch.rand(B, 2, device=device, dtype=dtype),
             torch.rand(B, 2, device=device, dtype=dtype) * 0.5 + 0.1
@@ -237,6 +238,28 @@ def test_box_bmhrbp():
     )    
     tester.run(Ch=Ch, Nh=Nh, W=W, H=H)
 
+
+def test_box_gaussian():
+    B, Nh = 16*300, 8
+    H, W = 64, 64
+
+    input_creators = {
+        "boxes": lambda device, dtype: torch.cat([
+            torch.rand(B, 2, device=device, dtype=dtype),
+            torch.rand(B, 2, device=device, dtype=dtype) * 0.5 + 0.1
+        ], dim=-1),
+        "offset": lambda device, dtype: (torch.rand(B, Nh, 2, device=device, dtype=dtype) - 0.5) * 0.2,
+        "sigma": lambda device, dtype: torch.rand(B, Nh, 2, device=device, dtype=dtype) * 0.5 + 0.1,
+    }
+    arg_order = ["boxes", "offset", "sigma", "H", "W"]
+
+    tester = CUDAKernelTester(
+        cuda_function=BoxGaussianCUDAFunction.apply,
+        python_function=box_gaussian_python,
+        input_creators=input_creators,
+        arg_order=arg_order
+    )    
+    tester.run(H=H, W=W)
 
 def test_box_pair_rbp():
     B, N1, N2, Ch = 16, 300, 300, 16
@@ -313,4 +336,5 @@ if __name__ == "__main__":
     #test_box_brbp()
     #test_box_pair_rbp()
     #test_box_pair_brbp()
-    test_box_bmhrbp()
+    #test_box_bmhrbp()
+    test_box_gaussian()
