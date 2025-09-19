@@ -13,6 +13,7 @@ from functions import (
     BoxGaussianCUDAFunction, box_gaussian_python,
     BoxPairRPBCUDAFunction, box_pair_rbp_python,
     BoxPairBRPBCUDAFunction, box_pair_brbp_python,
+    BoxPairGaussianCUDAFunction, box_pair_gaussian_python,
     AttentionCUDAFunction, attn_python,
 )
 
@@ -310,6 +311,32 @@ def test_box_pair_brbp():
     )    
     tester.run(Ch=Ch)
 
+def test_box_pair_gaussian():
+    B, N1, N2 = 16*8, 300, 300
+
+    input_creators = {
+        "boxes1": lambda device, dtype: torch.cat([
+            torch.rand(B, 2, device=device, dtype=dtype),
+            torch.rand(B, 2, device=device, dtype=dtype) * 0.5 + 0.1
+        ], dim=-1),
+        "offset1": lambda device, dtype: (torch.rand(B, N1, 2, device=device, dtype=dtype) - 0.5) * 0.2,
+        "sigma1": lambda device, dtype: torch.rand(B, N1, 2, device=device, dtype=dtype) * 0.5 + 0.1,
+        "boxes2": lambda device, dtype: torch.cat([
+            torch.rand(B, 2, device=device, dtype=dtype),
+            torch.rand(B, 2, device=device, dtype=dtype) * 0.5 + 0.1
+        ], dim=-1),
+        "offset2": lambda device, dtype: (torch.rand(B, N2, 2, device=device, dtype=dtype) - 0.5) * 0.2,
+        "sigma2": lambda device, dtype: torch.rand(B, N2, 2, device=device, dtype=dtype) * 0.5 + 0.1,
+    }
+    arg_order = ["boxes1", "offset1", "sigma1", "boxes2", "offset2", "sigma2"]
+
+    tester = CUDAKernelTester(
+        cuda_function=BoxPairGaussianCUDAFunction.apply,
+        python_function=box_pair_gaussian_python,
+        input_creators=input_creators,
+        arg_order=arg_order
+    )    
+    tester.run()
 
 def test_attention():
     B, Nh, Nq, Nk, C = 16, 8, 300, 300, 32
@@ -337,4 +364,5 @@ if __name__ == "__main__":
     #test_box_pair_rbp()
     #test_box_pair_brbp()
     #test_box_bmhrbp()
-    test_box_gaussian()
+    #test_box_gaussian()
+    test_box_pair_gaussian()

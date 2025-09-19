@@ -98,6 +98,25 @@ torch::Tensor fused_box_pair_brpb_backward(
     const int c_hidden
 );
 
+torch::Tensor fused_box_pair_gaussian_forward(
+    const torch::Tensor& boxes1,
+    const torch::Tensor& offset1,
+    const torch::Tensor& sigma1,
+    const torch::Tensor& boxes2,
+    const torch::Tensor& offset2,
+    const torch::Tensor& sigma2
+);
+
+std::vector<torch::Tensor> fused_box_pair_gaussian_backward(
+    const torch::Tensor& grad_output,
+    const torch::Tensor& boxes1,
+    const torch::Tensor& offset1,
+    const torch::Tensor& sigma1,
+    const torch::Tensor& boxes2,
+    const torch::Tensor& offset2,
+    const torch::Tensor& sigma2
+);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward_attn", &attn_forward, "Fused Attention Forward (Multi-Head)");
     m.def("forward_brpb", &fused_box_brpb_forward, "Fused Attention Forward (Multi-Head)");
@@ -112,4 +131,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("backward_pair_rpb", &fused_box_pair_rpb_backward, "Fused Attention Backward (Multi-Head)");
     m.def("forward_pair_brpb", &fused_box_pair_brpb_forward, "Fused Attention Forward (Multi-Head)");
     m.def("backward_pair_brpb", &fused_box_pair_brpb_backward, "Fused Attention Backward (Multi-Head)");
+    m.def("forward_pair_gaussian", &fused_box_pair_gaussian_forward, "Fused Attention Forward (Multi-Head)");
+    m.def("backward_pair_gaussian", &fused_box_pair_gaussian_backward, "Fused Attention Backward (Multi-Head)");
 }

@@ -9,7 +9,7 @@
 #include "utils.h"
 
 const int THREADS_PER_BLOCK_FORWARD = 1024;
-const int THREADS_PER_BLOCK_BACKWARD = 1024;
+const int THREADS_PER_BLOCK_BACKWARD = 256;
 
 template <int H, int W, int N_HEADS>
 __global__ void __launch_bounds__(THREADS_PER_BLOCK_FORWARD) box_gaussian_forward_kernel(
@@ -207,9 +207,6 @@ torch::Tensor fused_box_gaussian_forward(
     return output;
 }
 
-// The number of threads in the reduction block
-const int THREADS_PER_BLOCK_REDUCE = 256;
-
 // A warp-level reduction utility. Sums a float value across all 32 threads in a warp.
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     // Each thread adds the value from the thread 16 lanes away
@@ -226,7 +223,7 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
 }
 
 
-__global__ void __launch_bounds__(THREADS_PER_BLOCK_REDUCE) box_gaussian_backward_optimized_kernel(
+__global__ void __launch_bounds__(THREADS_PER_BLOCK_BACKWARD) box_gaussian_backward_optimized_kernel(
     const float* __restrict__ grad_output,
     const float* __restrict__ boxes,
     const float* __restrict__ offset,
@@ -318,7 +315,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK_REDUCE) box_gaussian_backwar
     float warp_d_sigma_y = warp_reduce_sum(local_d_sigma_y);
 
     // Shared memory for the final reduction across warps (one entry per warp)
-    __shared__ float s_reduction_memory[4 * (THREADS_PER_BLOCK_REDUCE / 32)];
+    __shared__ float s_reduction_memory[4 * (THREADS_PER_BLOCK_BACKWARD / 32)];
 
     const int warp_id = threadIdx.x / 32;
     const int lane_id = threadIdx.x % 32;
@@ -378,7 +375,7 @@ std::vector<torch::Tensor> fused_box_gaussian_backward(
 
     // Each block processes one head
     const int grid_dim = B * N_HEADS;
-    const int block_dim = THREADS_PER_BLOCK_REDUCE;
+    const int block_dim = THREADS_PER_BLOCK_BACKWARD;
 
     box_gaussian_backward_optimized_kernel<<<grid_dim, block_dim>>>(
         grad_output.data_ptr<float>(),
