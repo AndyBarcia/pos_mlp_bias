@@ -112,7 +112,14 @@ class PosGaussian(torch.nn.Module):
     width and height of the box. The computation is fully differentiable with
     respect to both `boxes` and `sigma`.
     """
-    def __init__(self, dim, n_heads, implementation: str = "cuda"):
+    def __init__(
+        self, 
+        dim, 
+        n_heads, 
+        implementation: str = "cuda",
+        normalize: bool = False,
+        learned_scale: bool = False,
+    ):
         super().__init__()
         self.dim = dim
         self.n_heads = n_heads
@@ -120,6 +127,15 @@ class PosGaussian(torch.nn.Module):
         assert implementation in ["python", "cuda"]
 
         self.weight_generator = torch.nn.Linear(dim, n_heads*4) # 2 for offset, 2 for sigma
+
+        self.normalize = normalize
+        if self.normalize:
+            self.offset_norm = torch.nn.LayerNorm(n_heads*2)
+            self.sigma_norm = torch.nn.LayerNorm(n_heads*2)
+
+        self.learned_scale = learned_scale
+        if self.learned_scale:
+            self.scales = torch.nn.Linear(self.dim, n_heads)
 
         self._reset_parameters()
 
@@ -149,10 +165,24 @@ class PosGaussian(torch.nn.Module):
         offsets = weights[:, :self.n_heads*2].view(-1, self.n_heads, 2) # (B,Nheads,[offset_x, offset_y])
         sigmas = weights[:, self.n_heads*2:].view(-1, self.n_heads, 2) # (B,Nheads,[sigma_x, sigma_y])
 
+        # Normalize offsets and sigmas
+        if self.normalize:
+            offsets = self.offset_norm(offsets.view(offsets.shape[0], -1)).view_as(offsets)
+            sigmas = self.sigma_norm(sigmas.view(sigmas.shape[0], -1)).view_as(sigmas) + 1.0
+
+        # Limit for stability
+        offsets = offsets.clamp(-5.0, 5.0)
+        sigmas = sigmas.clamp(0.1, 10.0)
+
         if implementation_to_use == "cuda":
             output = BoxGaussianCUDAFunction.apply(pos, offsets, sigmas, size[0], size[1])
         elif implementation_to_use == "python":
             output = box_gaussian_python(pos, offsets, sigmas, size[0], size[1])
+
+        # Scale each head by learned factor.
+        if self.learned_scale:
+            scales = self.scales(queries).view(-1, self.n_heads, 1, 1) # (B,Nheads,1,1)
+            output = output * scales
 
         final_shape = pos_ps[0] + (self.n_heads, size[0], size[1])
         return output.view(final_shape)
@@ -446,7 +476,8 @@ class PosGaussianAttention(torch.nn.Module):
         dim: int,
         k_dim: Optional[int] = None,
         n_heads: int = 8,
-        hidden_dim: int = 16,
+        normalize: bool = False,
+        learned_scale: bool = False,
         normalize_before: bool = False,
         dropout: float = 0.0,
         implementation: str = "cuda"
@@ -458,7 +489,7 @@ class PosGaussianAttention(torch.nn.Module):
         self.head_dim = dim // n_heads
         assert dim % n_heads == 0, f"dim ({dim}) must be divisible by n_heads ({n_heads})"
 
-        self.pos_mlp_bias = PosGaussian(dim, n_heads, implementation)
+        self.pos_mlp_bias = PosGaussian(dim, n_heads, implementation, normalize=normalize, learned_scale=learned_scale)
 
         # Linear projections for Q, K, V
         self.q_proj = torch.nn.Linear(dim, dim, bias=False)
