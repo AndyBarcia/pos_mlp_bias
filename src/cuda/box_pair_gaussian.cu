@@ -9,7 +9,10 @@
 #include "utils.h"
 
 const int THREADS_PER_BLOCK_FORWARD = 1024;
-const int THREADS_PER_BLOCK_BACKWARD = 1024;
+const int THREADS_PER_BLOCK_BACKWARD = 64; 
+// 256 -> 3.4ms
+// 128 -> 2.7ms
+// 64 -> 2.5ms
 
 __global__ void __launch_bounds__(THREADS_PER_BLOCK_FORWARD) box_pair_gaussian_forward_kernel(
     const float* __restrict__ boxes1,
@@ -139,7 +142,21 @@ torch::Tensor fused_box_pair_gaussian_forward(
     return output;
 }
 
-__global__ void box_pair_gaussian_backward_kernel(
+// A warp-level reduction utility. Sums a float value across all 32 threads in a warp.
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    val += __shfl_down_sync(0xFFFFFFFF, val, 16);
+    val += __shfl_down_sync(0xFFFFFFFF, val, 8);
+    val += __shfl_down_sync(0xFFFFFFFF, val, 4);
+    val += __shfl_down_sync(0xFFFFFFFF, val, 2);
+    val += __shfl_down_sync(0xFFFFFFFF, val, 1);
+    return __shfl_sync(0xFFFFFFFF, val, 0);
+}
+
+// 19ms 
+// 3ms
+
+// Kernel to compute gradients for the first set of inputs (offset1, sigma1)
+__global__ void __launch_bounds__(THREADS_PER_BLOCK_BACKWARD) box_pair_gaussian_backward_grad1_kernel(
     const float* __restrict__ grad_output,
     const float* __restrict__ boxes1,
     const float* __restrict__ offset1,
@@ -147,111 +164,259 @@ __global__ void box_pair_gaussian_backward_kernel(
     const float* __restrict__ boxes2,
     const float* __restrict__ offset2,
     const float* __restrict__ sigma2,
-    int B,
-    int N_HEADS,
-    int M_HEADS,
+    int B, int N_HEADS, int M_HEADS,
     float* __restrict__ d_offset1,
-    float* __restrict__ d_sigma1,
+    float* __restrict__ d_sigma1
+) {
+    // Each block is responsible for one head from the first set, e.g., (b, n)
+    const int head1_id = blockIdx.x;
+    const int b = head1_id / N_HEADS;
+    const int n_idx = head1_id % N_HEADS;
+
+    // --- 1. Cache primary head data in shared memory ---
+    __shared__ float s_data1[8]; // box1(4), offset1(2), sigma1(2)
+
+    if (threadIdx.x == 0) {
+        const int box1_offset = b * 4;
+        s_data1[0] = boxes1[box1_offset + 0];
+        s_data1[1] = boxes1[box1_offset + 1];
+        s_data1[2] = boxes1[box1_offset + 2] * 0.5f; // half_w
+        s_data1[3] = boxes1[box1_offset + 3] * 0.5f; // half_h
+
+        const int head1_params_offset = (b * N_HEADS + n_idx) * 2;
+        s_data1[4] = offset1[head1_params_offset + 0];
+        s_data1[5] = offset1[head1_params_offset + 1];
+        s_data1[6] = sigma1[head1_params_offset + 0];
+        s_data1[7] = sigma1[head1_params_offset + 1];
+    }
+    __syncthreads();
+
+    const float half_w1 = s_data1[2];
+    const float half_h1 = s_data1[3];
+    const float mu1_x = s_data1[0] + s_data1[4] * half_w1;
+    const float mu1_y = s_data1[1] + s_data1[5] * half_h1;
+    const float sig1_x = fmaxf(s_data1[6] * half_w1, 1e-6f);
+    const float sig1_y = fmaxf(s_data1[7] * half_h1, 1e-6f);
+
+    float local_d_offset_x = 0.0f, local_d_offset_y = 0.0f;
+    float local_d_sigma_x = 0.0f, local_d_sigma_y = 0.0f;
+
+    // --- 2. Grid-stride loop over heads in the second set ---
+    for (int m_idx = threadIdx.x; m_idx < M_HEADS; m_idx += blockDim.x) {
+        // Load data for the corresponding head from the second set
+        const int box2_offset = b * 4;
+        const float half_w2 = boxes2[box2_offset + 2] * 0.5f;
+        const float half_h2 = boxes2[box2_offset + 3] * 0.5f;
+
+        const int head2_params_offset = (b * M_HEADS + m_idx) * 2;
+        const float mu2_x = boxes2[box2_offset + 0] + offset2[head2_params_offset + 0] * half_w2;
+        const float mu2_y = boxes2[box2_offset + 1] + offset2[head2_params_offset + 1] * half_h2;
+        const float sig2_x = fmaxf(sigma2[head2_params_offset + 0] * half_w2, 1e-6f);
+        const float sig2_y = fmaxf(sigma2[head2_params_offset + 1] * half_h2, 1e-6f);
+        
+        // Re-compute forward pass components
+        const float mu_diff_x = mu1_x - mu2_x;
+        const float var_sum_x = sig1_x * sig1_x + sig2_x * sig2_x;
+        const float bc_x = sqrtf(2.0f * sig1_x * sig2_x / var_sum_x) * __expf(-0.25f * mu_diff_x * mu_diff_x / var_sum_x);
+
+        const float mu_diff_y = mu1_y - mu2_y;
+        const float var_sum_y = sig1_y * sig1_y + sig2_y * sig2_y;
+        const float bc_y = sqrtf(2.0f * sig1_y * sig2_y / var_sum_y) * __expf(-0.25f * mu_diff_y * mu_diff_y / var_sum_y);
+
+        // Calculate and accumulate gradients in private registers
+        const int grad_idx = b * N_HEADS * M_HEADS + n_idx * M_HEADS + m_idx;
+        const float g_out = grad_output[grad_idx];
+        const float g_bc_x = g_out * bc_y;
+        const float g_bc_y = g_out * bc_x;
+
+        const float dL_dmu1_x = g_bc_x * bc_x * (-0.5f * mu_diff_x / var_sum_x);
+        const float dL_dmu1_y = g_bc_y * bc_y * (-0.5f * mu_diff_y / var_sum_y);
+
+        const float term1_sig1_x = (sig2_x * sig2_x - sig1_x * sig1_x) / sig1_x;
+        const float term2_sig1_x = (mu_diff_x * mu_diff_x * sig1_x) / var_sum_x;
+        const float dL_dsig1_x = g_bc_x * bc_x * (term1_sig1_x + term2_sig1_x) / (2.0f * var_sum_x);
+
+        const float term1_sig1_y = (sig2_y * sig2_y - sig1_y * sig1_y) / sig1_y;
+        const float term2_sig1_y = (mu_diff_y * mu_diff_y * sig1_y) / var_sum_y;
+        const float dL_dsig1_y = g_bc_y * bc_y * (term1_sig1_y + term2_sig1_y) / (2.0f * var_sum_y);
+
+        local_d_offset_x += dL_dmu1_x * half_w1;
+        local_d_offset_y += dL_dmu1_y * half_h1;
+        local_d_sigma_x += dL_dsig1_x * half_w1;
+        local_d_sigma_y += dL_dsig1_y * half_h1;
+    }
+
+    // --- 3. Block-Level Reduction ---
+    float warp_d_offset_x = warp_reduce_sum(local_d_offset_x);
+    float warp_d_offset_y = warp_reduce_sum(local_d_offset_y);
+    float warp_d_sigma_x = warp_reduce_sum(local_d_sigma_x);
+    float warp_d_sigma_y = warp_reduce_sum(local_d_sigma_y);
+
+    __shared__ float s_reduction_memory[4 * (THREADS_PER_BLOCK_BACKWARD / 32)];
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    const int num_warps = blockDim.x / 32;
+
+    if (lane_id == 0) {
+        s_reduction_memory[warp_id] = warp_d_offset_x;
+        s_reduction_memory[warp_id + num_warps] = warp_d_offset_y;
+        s_reduction_memory[warp_id + 2 * num_warps] = warp_d_sigma_x;
+        s_reduction_memory[warp_id + 3 * num_warps] = warp_d_sigma_y;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float final_d_offset_x = (lane_id < num_warps) ? s_reduction_memory[lane_id] : 0.0f;
+        float final_d_offset_y = (lane_id < num_warps) ? s_reduction_memory[lane_id + num_warps] : 0.0f;
+        float final_d_sigma_x = (lane_id < num_warps) ? s_reduction_memory[lane_id + 2 * num_warps] : 0.0f;
+        float final_d_sigma_y = (lane_id < num_warps) ? s_reduction_memory[lane_id + 3 * num_warps] : 0.0f;
+
+        final_d_offset_x = warp_reduce_sum(final_d_offset_x);
+        final_d_offset_y = warp_reduce_sum(final_d_offset_y);
+        final_d_sigma_x = warp_reduce_sum(final_d_sigma_x);
+        final_d_sigma_y = warp_reduce_sum(final_d_sigma_y);
+
+        // --- 4. Single write to global memory ---
+        if (lane_id == 0) {
+            const int head1_params_offset = head1_id * 2;
+            d_offset1[head1_params_offset + 0] = final_d_offset_x;
+            d_offset1[head1_params_offset + 1] = final_d_offset_y;
+            d_sigma1[head1_params_offset + 0] = final_d_sigma_x;
+            d_sigma1[head1_params_offset + 1] = final_d_sigma_y;
+        }
+    }
+}
+
+
+// Kernel to compute gradients for the second set of inputs (offset2, sigma2)
+__global__ void __launch_bounds__(THREADS_PER_BLOCK_BACKWARD) box_pair_gaussian_backward_grad2_kernel(
+    const float* __restrict__ grad_output,
+    const float* __restrict__ boxes1,
+    const float* __restrict__ offset1,
+    const float* __restrict__ sigma1,
+    const float* __restrict__ boxes2,
+    const float* __restrict__ offset2,
+    const float* __restrict__ sigma2,
+    int B, int N_HEADS, int M_HEADS,
     float* __restrict__ d_offset2,
     float* __restrict__ d_sigma2
 ) {
-    const int total_elements = B * N_HEADS * M_HEADS;
-    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= total_elements) return;
+    // Each block is responsible for one head from the second set, e.g., (b, m)
+    const int head2_id = blockIdx.x;
+    const int b = head2_id / M_HEADS;
+    const int m_idx = head2_id % M_HEADS;
 
-    // Decompose the global thread index to get batch and head indices
-    const int b = tid / (N_HEADS * M_HEADS);
-    const int n_idx = (tid / M_HEADS) % N_HEADS;
-    const int m_idx = tid % M_HEADS;
+    // --- 1. Cache primary head data in shared memory ---
+    __shared__ float s_data2[8]; // box2(4), offset2(2), sigma2(2)
 
-    // --- 1. Re-compute the forward pass for the current pair ---
+    if (threadIdx.x == 0) {
+        const int box2_offset = b * 4;
+        s_data2[0] = boxes2[box2_offset + 0];
+        s_data2[1] = boxes2[box2_offset + 1];
+        s_data2[2] = boxes2[box2_offset + 2] * 0.5f; // half_w
+        s_data2[3] = boxes2[box2_offset + 3] * 0.5f; // half_h
 
-    // Gaussian 1 (from set 1, head n)
-    const int box1_offset = b * 4;
-    const float half_w1 = boxes1[box1_offset + 2] * 0.5f;
-    const float half_h1 = boxes1[box1_offset + 3] * 0.5f;
-    
-    const int head1_params_offset = (b * N_HEADS + n_idx) * 2;
-    const float mu1_x = boxes1[box1_offset + 0] + offset1[head1_params_offset + 0] * half_w1;
-    const float mu1_y = boxes1[box1_offset + 1] + offset1[head1_params_offset + 1] * half_h1;
-    const float sig1_x = fmaxf(sigma1[head1_params_offset + 0] * half_w1, 1e-6f);
-    const float sig1_y = fmaxf(sigma1[head1_params_offset + 1] * half_h1, 1e-6f);
+        const int head2_params_offset = (b * M_HEADS + m_idx) * 2;
+        s_data2[4] = offset2[head2_params_offset + 0];
+        s_data2[5] = offset2[head2_params_offset + 1];
+        s_data2[6] = sigma2[head2_params_offset + 0];
+        s_data2[7] = sigma2[head2_params_offset + 1];
+    }
+    __syncthreads();
 
-    // Gaussian 2 (from set 2, head m)
-    const int box2_offset = b * 4;
-    const float half_w2 = boxes2[box2_offset + 2] * 0.5f;
-    const float half_h2 = boxes2[box2_offset + 3] * 0.5f;
+    const float half_w2 = s_data2[2];
+    const float half_h2 = s_data2[3];
+    const float mu2_x = s_data2[0] + s_data2[4] * half_w2;
+    const float mu2_y = s_data2[1] + s_data2[5] * half_h2;
+    const float sig2_x = fmaxf(s_data2[6] * half_w2, 1e-6f);
+    const float sig2_y = fmaxf(s_data2[7] * half_h2, 1e-6f);
 
-    const int head2_params_offset = (b * M_HEADS + m_idx) * 2;
-    const float mu2_x = boxes2[box2_offset + 0] + offset2[head2_params_offset + 0] * half_w2;
-    const float mu2_y = boxes2[box2_offset + 1] + offset2[head2_params_offset + 1] * half_h2;
-    const float sig2_x = fmaxf(sigma2[head2_params_offset + 0] * half_w2, 1e-6f);
-    const float sig2_y = fmaxf(sigma2[head2_params_offset + 1] * half_h2, 1e-6f);
+    float local_d_offset_x = 0.0f, local_d_offset_y = 0.0f;
+    float local_d_sigma_x = 0.0f, local_d_sigma_y = 0.0f;
 
-    // Bhattacharyya coefficients per dimension
-    const float mu_diff_x = mu1_x - mu2_x;
-    const float var_sum_x = sig1_x * sig1_x + sig2_x * sig2_x;
-    const float bc_x = sqrtf(2.0f * sig1_x * sig2_x / var_sum_x) * __expf(-0.25f * mu_diff_x * mu_diff_x / var_sum_x);
+    // --- 2. Grid-stride loop over heads in the first set ---
+    for (int n_idx = threadIdx.x; n_idx < N_HEADS; n_idx += blockDim.x) {
+        const int box1_offset = b * 4;
+        const float half_w1 = boxes1[box1_offset + 2] * 0.5f;
+        const float half_h1 = boxes1[box1_offset + 3] * 0.5f;
 
-    const float mu_diff_y = mu1_y - mu2_y;
-    const float var_sum_y = sig1_y * sig1_y + sig2_y * sig2_y;
-    const float bc_y = sqrtf(2.0f * sig1_y * sig2_y / var_sum_y) * __expf(-0.25f * mu_diff_y * mu_diff_y / var_sum_y);
+        const int head1_params_offset = (b * N_HEADS + n_idx) * 2;
+        const float mu1_x = boxes1[box1_offset + 0] + offset1[head1_params_offset + 0] * half_w1;
+        const float mu1_y = boxes1[box1_offset + 1] + offset1[head1_params_offset + 1] * half_h1;
+        const float sig1_x = fmaxf(sigma1[head1_params_offset + 0] * half_w1, 1e-6f);
+        const float sig1_y = fmaxf(sigma1[head1_params_offset + 1] * half_h1, 1e-6f);
 
-    // --- 2. Calculate gradients using the chain rule ---
+        const float mu_diff_x = mu1_x - mu2_x;
+        const float var_sum_x = sig1_x * sig1_x + sig2_x * sig2_x;
+        const float bc_x = sqrtf(2.0f * sig1_x * sig2_x / var_sum_x) * __expf(-0.25f * mu_diff_x * mu_diff_x / var_sum_x);
 
-    const float g_out = grad_output[tid];
+        const float mu_diff_y = mu1_y - mu2_y;
+        const float var_sum_y = sig1_y * sig1_y + sig2_y * sig2_y;
+        const float bc_y = sqrtf(2.0f * sig1_y * sig2_y / var_sum_y) * __expf(-0.25f * mu_diff_y * mu_diff_y / var_sum_y);
 
-    // Incoming gradients for each 1D BC
-    const float g_bc_x = g_out * bc_y;
-    const float g_bc_y = g_out * bc_x;
+        const int grad_idx = b * N_HEADS * M_HEADS + n_idx * M_HEADS + m_idx;
+        const float g_out = grad_output[grad_idx];
+        const float g_bc_x = g_out * bc_y;
+        const float g_bc_y = g_out * bc_x;
 
-    // Gradient w.r.t. effective centers (mu)
-    const float dL_dmu1_x = g_bc_x * bc_x * (-0.5f * mu_diff_x / var_sum_x);
-    const float dL_dmu1_y = g_bc_y * bc_y * (-0.5f * mu_diff_y / var_sum_y);
-    const float dL_dmu2_x = -dL_dmu1_x;
-    const float dL_dmu2_y = -dL_dmu1_y;
+        const float dL_dmu2_x = g_bc_x * bc_x * (0.5f * mu_diff_x / var_sum_x);
+        const float dL_dmu2_y = g_bc_y * bc_y * (0.5f * mu_diff_y / var_sum_y);
 
-    // Gradient w.r.t. effective sigmas
-    const float term1_sig1_x = (sig2_x * sig2_x - sig1_x * sig1_x) / sig1_x;
-    const float term2_sig1_x = (mu_diff_x * mu_diff_x * sig1_x) / var_sum_x;
-    const float dL_dsig1_x = g_bc_x * bc_x * (term1_sig1_x + term2_sig1_x) / (2.0f * var_sum_x);
+        const float term1_sig2_x = (sig1_x * sig1_x - sig2_x * sig2_x) / sig2_x;
+        const float term2_sig2_x = (mu_diff_x * mu_diff_x * sig2_x) / var_sum_x;
+        const float dL_dsig2_x = g_bc_x * bc_x * (term1_sig2_x + term2_sig2_x) / (2.0f * var_sum_x);
 
-    const float term1_sig1_y = (sig2_y * sig2_y - sig1_y * sig1_y) / sig1_y;
-    const float term2_sig1_y = (mu_diff_y * mu_diff_y * sig1_y) / var_sum_y;
-    const float dL_dsig1_y = g_bc_y * bc_y * (term1_sig1_y + term2_sig1_y) / (2.0f * var_sum_y);
+        const float term1_sig2_y = (sig1_y * sig1_y - sig2_y * sig2_y) / sig2_y;
+        const float term2_sig2_y = (mu_diff_y * mu_diff_y * sig2_y) / var_sum_y;
+        const float dL_dsig2_y = g_bc_y * bc_y * (term1_sig2_y + term2_sig2_y) / (2.0f * var_sum_y);
 
-    const float term1_sig2_x = (sig1_x * sig1_x - sig2_x * sig2_x) / sig2_x;
-    const float term2_sig2_x = (mu_diff_x * mu_diff_x * sig2_x) / var_sum_x;
-    const float dL_dsig2_x = g_bc_x * bc_x * (term1_sig2_x + term2_sig2_x) / (2.0f * var_sum_x);
+        local_d_offset_x += dL_dmu2_x * half_w2;
+        local_d_offset_y += dL_dmu2_y * half_h2;
+        local_d_sigma_x += dL_dsig2_x * half_w2;
+        local_d_sigma_y += dL_dsig2_y * half_h2;
+    }
 
-    const float term1_sig2_y = (sig1_y * sig1_y - sig2_y * sig2_y) / sig2_y;
-    const float term2_sig2_y = (mu_diff_y * mu_diff_y * sig2_y) / var_sum_y;
-    const float dL_dsig2_y = g_bc_y * bc_y * (term1_sig2_y + term2_sig2_y) / (2.0f * var_sum_y);
+    // --- 3. Block-Level Reduction --- (Identical logic)
+    float warp_d_offset_x = warp_reduce_sum(local_d_offset_x);
+    float warp_d_offset_y = warp_reduce_sum(local_d_offset_y);
+    float warp_d_sigma_x = warp_reduce_sum(local_d_sigma_x);
+    float warp_d_sigma_y = warp_reduce_sum(local_d_sigma_y);
 
-    // --- 3. Chain gradients back to original inputs ---
+    __shared__ float s_reduction_memory[4 * (THREADS_PER_BLOCK_BACKWARD / 32)];
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    const int num_warps = blockDim.x / 32;
 
-    const float d_offset1_x = dL_dmu1_x * half_w1;
-    const float d_offset1_y = dL_dmu1_y * half_h1;
-    const float d_sigma1_x = dL_dsig1_x * half_w1;
-    const float d_sigma1_y = dL_dsig1_y * half_h1;
+    if (lane_id == 0) {
+        s_reduction_memory[warp_id] = warp_d_offset_x;
+        s_reduction_memory[warp_id + num_warps] = warp_d_offset_y;
+        s_reduction_memory[warp_id + 2 * num_warps] = warp_d_sigma_x;
+        s_reduction_memory[warp_id + 3 * num_warps] = warp_d_sigma_y;
+    }
+    __syncthreads();
 
-    const float d_offset2_x = dL_dmu2_x * half_w2;
-    const float d_offset2_y = dL_dmu2_y * half_h2;
-    const float d_sigma2_x = dL_dsig2_x * half_w2;
-    const float d_sigma2_y = dL_dsig2_y * half_h2;
+    if (warp_id == 0) {
+        float final_d_offset_x = (lane_id < num_warps) ? s_reduction_memory[lane_id] : 0.0f;
+        float final_d_offset_y = (lane_id < num_warps) ? s_reduction_memory[lane_id + num_warps] : 0.0f;
+        float final_d_sigma_x = (lane_id < num_warps) ? s_reduction_memory[lane_id + 2 * num_warps] : 0.0f;
+        float final_d_sigma_y = (lane_id < num_warps) ? s_reduction_memory[lane_id + 3 * num_warps] : 0.0f;
 
-    // --- 4. Atomically add gradients to output tensors ---
+        final_d_offset_x = warp_reduce_sum(final_d_offset_x);
+        final_d_offset_y = warp_reduce_sum(final_d_offset_y);
+        final_d_sigma_x = warp_reduce_sum(final_d_sigma_x);
+        final_d_sigma_y = warp_reduce_sum(final_d_sigma_y);
 
-    atomicAdd(&d_offset1[head1_params_offset + 0], d_offset1_x);
-    atomicAdd(&d_offset1[head1_params_offset + 1], d_offset1_y);
-    atomicAdd(&d_sigma1[head1_params_offset + 0], d_sigma1_x);
-    atomicAdd(&d_sigma1[head1_params_offset + 1], d_sigma1_y);
-
-    atomicAdd(&d_offset2[head2_params_offset + 0], d_offset2_x);
-    atomicAdd(&d_offset2[head2_params_offset + 1], d_offset2_y);
-    atomicAdd(&d_sigma2[head2_params_offset + 0], d_sigma2_x);
-    atomicAdd(&d_sigma2[head2_params_offset + 1], d_sigma2_y);
+        // --- 4. Single write to global memory ---
+        if (lane_id == 0) {
+            const int head2_params_offset = head2_id * 2;
+            d_offset2[head2_params_offset + 0] = final_d_offset_x;
+            d_offset2[head2_params_offset + 1] = final_d_offset_y;
+            d_sigma2[head2_params_offset + 0] = final_d_sigma_x;
+            d_sigma2[head2_params_offset + 1] = final_d_sigma_y;
+        }
+    }
 }
+
 
 std::vector<torch::Tensor> fused_box_pair_gaussian_backward(
     const torch::Tensor& grad_output,
@@ -262,13 +427,8 @@ std::vector<torch::Tensor> fused_box_pair_gaussian_backward(
     const torch::Tensor& offset2,
     const torch::Tensor& sigma2
 ) {
-    CHECK_INPUT(grad_output);
-    CHECK_INPUT(boxes1);
-    CHECK_INPUT(offset1);
-    CHECK_INPUT(sigma1);
-    CHECK_INPUT(boxes2);
-    CHECK_INPUT(offset2);
-    CHECK_INPUT(sigma2);
+    CHECK_INPUT(grad_output); CHECK_INPUT(boxes1); CHECK_INPUT(offset1); CHECK_INPUT(sigma1);
+    CHECK_INPUT(boxes2); CHECK_INPUT(offset2); CHECK_INPUT(sigma2);
 
     const int B = boxes1.size(0);
     const int N_HEADS = offset1.size(1);
@@ -279,32 +439,31 @@ std::vector<torch::Tensor> fused_box_pair_gaussian_backward(
     auto d_offset2 = torch::zeros_like(offset2);
     auto d_sigma2 = torch::zeros_like(sigma2);
 
-    const int total_elements = B * N_HEADS * M_HEADS;
-    if (total_elements == 0) {
-        return {d_offset1, d_sigma1, d_offset2, d_sigma2};
+    const int block_dim = THREADS_PER_BLOCK_BACKWARD;
+
+    // Launch first kernel for d_offset1 and d_sigma1
+    if (N_HEADS > 0) {
+        const int grid_dim1 = B * N_HEADS;
+        box_pair_gaussian_backward_grad1_kernel<<<grid_dim1, block_dim>>>(
+            grad_output.data_ptr<float>(), boxes1.data_ptr<float>(), offset1.data_ptr<float>(), sigma1.data_ptr<float>(),
+            boxes2.data_ptr<float>(), offset2.data_ptr<float>(), sigma2.data_ptr<float>(),
+            B, N_HEADS, M_HEADS,
+            d_offset1.data_ptr<float>(), d_sigma1.data_ptr<float>()
+        );
     }
     
-    const int blocks = (total_elements + THREADS_PER_BLOCK_BACKWARD - 1) / THREADS_PER_BLOCK_BACKWARD;
-
-    box_pair_gaussian_backward_kernel<<<blocks, THREADS_PER_BLOCK_BACKWARD>>>(
-        grad_output.data_ptr<float>(),
-        boxes1.data_ptr<float>(),
-        offset1.data_ptr<float>(),
-        sigma1.data_ptr<float>(),
-        boxes2.data_ptr<float>(),
-        offset2.data_ptr<float>(),
-        sigma2.data_ptr<float>(),
-        B,
-        N_HEADS,
-        M_HEADS,
-        d_offset1.data_ptr<float>(),
-        d_sigma1.data_ptr<float>(),
-        d_offset2.data_ptr<float>(),
-        d_sigma2.data_ptr<float>()
-    );
+    // Launch second kernel for d_offset2 and d_sigma2
+    if (M_HEADS > 0) {
+        const int grid_dim2 = B * M_HEADS;
+        box_pair_gaussian_backward_grad2_kernel<<<grid_dim2, block_dim>>>(
+            grad_output.data_ptr<float>(), boxes1.data_ptr<float>(), offset1.data_ptr<float>(), sigma1.data_ptr<float>(),
+            boxes2.data_ptr<float>(), offset2.data_ptr<float>(), sigma2.data_ptr<float>(),
+            B, N_HEADS, M_HEADS,
+            d_offset2.data_ptr<float>(), d_sigma2.data_ptr<float>()
+        );
+    }
 
     CHECK_CUDA_ERROR(cudaPeekAtLastError());
 
-    // Note: Gradients for boxes1 and boxes2 are not computed and implicitly returned as None/zero.
     return {d_offset1, d_sigma1, d_offset2, d_sigma2};
 }
