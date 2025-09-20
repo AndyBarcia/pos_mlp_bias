@@ -479,6 +479,7 @@ class PosGaussianAttention(torch.nn.Module):
         normalize: bool = False,
         learned_scale: bool = False,
         normalize_before: bool = False,
+        only_gaussian_logits: bool = False,
         dropout: float = 0.0,
         implementation: str = "cuda"
     ):
@@ -492,8 +493,13 @@ class PosGaussianAttention(torch.nn.Module):
         self.pos_mlp_bias = PosGaussian(dim, n_heads, implementation, normalize=normalize, learned_scale=learned_scale)
 
         # Linear projections for Q, K, V
-        self.q_proj = torch.nn.Linear(dim, dim, bias=False)
-        self.kv_proj = torch.nn.Linear(self.k_dim, dim * 2, bias=False)
+        self.only_gaussian_logits = only_gaussian_logits
+        if self.only_gaussian_logits:
+            self.v_proj = torch.nn.Linear(self.k_dim, dim, bias=False)
+        else:
+            self.q_proj = torch.nn.Linear(dim, dim, bias=False)
+            self.kv_proj = torch.nn.Linear(self.k_dim, dim * 2, bias=False)
+
         self.out_proj = torch.nn.Linear(dim, dim, bias=False)
 
         self.scale = self.head_dim ** -0.5
@@ -560,28 +566,35 @@ class PosGaussianAttention(torch.nn.Module):
         memory_flat = memory.view(batch_size, H * W, -1)  # (B, H*W, k_dim)
 
         # Compute Q, K, V
-        Q = self.q_proj(queries)  # (B, Q, dim)
-        K, V = self.kv_proj(memory_flat).chunk(2, dim=-1)  # Each: (B, H*W, dim)
+        if self.only_gaussian_logits:
+            V = self.v_proj(memory_flat)  # (B, H*W, dim)
+            V = V.view(batch_size, H * W, self.n_heads, self.head_dim)
+            V = V.transpose(1, 2)  # (B, n_heads, H*W, head_dim)
 
-        # Reshape for multi-head attention
-        Q = Q.view(batch_size, n_queries, self.n_heads, self.head_dim)
-        K = K.view(batch_size, H * W, self.n_heads, self.head_dim)
-        V = V.view(batch_size, H * W, self.n_heads, self.head_dim)
+            attention_logits = self.pos_mlp_bias(pos, (H, W), queries).transpose(1,2) # (B, n_heads, Q, H, W)
+        else:
+            Q = self.q_proj(queries)  # (B, Q, dim)
+            K, V = self.kv_proj(memory_flat).chunk(2, dim=-1)  # Each: (B, H*W, dim)
 
-        # Transpose for attention computation
-        Q = Q.transpose(1, 2)  # (B, n_heads, Q, head_dim)
-        K = K.transpose(1, 2)  # (B, n_heads, H*W, head_dim)
-        V = V.transpose(1, 2)  # (B, n_heads, H*W, head_dim)
+            # Reshape for multi-head attention
+            Q = Q.view(batch_size, n_queries, self.n_heads, self.head_dim)
+            K = K.view(batch_size, H * W, self.n_heads, self.head_dim)
+            V = V.view(batch_size, H * W, self.n_heads, self.head_dim)
 
-        # Compute attention scores
-        attention_logits = torch.matmul(Q, K.transpose(-2, -1)) * self.scale  # (B, n_heads, Q, H*W)
+            # Transpose for attention computation
+            Q = Q.transpose(1, 2)  # (B, n_heads, Q, head_dim)
+            K = K.transpose(1, 2)  # (B, n_heads, H*W, head_dim)
+            V = V.transpose(1, 2)  # (B, n_heads, H*W, head_dim)
 
-        # Reshape attention logits to (B, n_heads, Q, H, W) for adding positional bias
-        attention_logits = attention_logits.view(batch_size, self.n_heads, n_queries, H, W)
+            # Compute attention scores
+            attention_logits = torch.matmul(Q, K.transpose(-2, -1)) * self.scale  # (B, n_heads, Q, H*W)
 
-        # Add positional bias
-        pos_bias = self.pos_mlp_bias(pos, (H, W), queries).transpose(1,2) # (B, n_heads, Q, H, W)
-        attention_logits = attention_logits + pos_bias # (B, n_heads, Q, H, W)
+            # Reshape attention logits to (B, n_heads, Q, H, W) for adding positional bias
+            attention_logits = attention_logits.view(batch_size, self.n_heads, n_queries, H, W)
+
+            # Add positional bias
+            pos_bias = self.pos_mlp_bias(pos, (H, W), queries).transpose(1,2) # (B, n_heads, Q, H, W)
+            attention_logits = attention_logits + pos_bias # (B, n_heads, Q, H, W)
 
         # Apply attention mask if provided
         if attn_mask is not None:
