@@ -13,7 +13,8 @@ from .box_pair_gaussian_function import BoxPairGaussianCUDAFunction, box_pair_ga
 from .box_rpb import (
     PosMLP, PosMLPAttention,
     PosGaussian, PosGaussianAttention, 
-    PairPosMLP, PosMLPSelfAttention
+    PairPosMLP, PosMLPSelfAttention,
+    PosPairGaussian, PosPairGaussianAttention
 )
 
 from .attn_function import AttentionCUDAFunction, attn_python

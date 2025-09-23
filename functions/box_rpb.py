@@ -8,6 +8,7 @@ from .box_rpb_function import BoxRPBCUDAFunction, box_rbp_python
 from .box_brpb_function import BoxBRPBCUDAFunction, box_brbp_python
 
 from .box_gaussian_function import BoxGaussianCUDAFunction, box_gaussian_python
+from .box_pair_gaussian_function import BoxPairGaussianCUDAFunction, box_pair_gaussian_python
 
 from .box_pair_rpb_function import BoxPairRPBCUDAFunction, box_pair_rbp_python
 from .box_pair_brpb_function import BoxPairBRPBCUDAFunction, box_pair_brbp_python
@@ -185,6 +186,130 @@ class PosGaussian(torch.nn.Module):
             output = output * scales
 
         final_shape = pos_ps[0] + (self.n_heads, size[0], size[1])
+        return output.view(final_shape)
+
+
+class PosPairGaussian(torch.nn.Module):
+    """
+    Generates a batch of 2D Gaussian masks from bounding boxes.
+    The standard deviation (sigma) of the Gaussian is relative to the size of each
+    bounding box. A sigma of 1.0 means the standard deviation will be half the
+    width and height of the box. The computation is fully differentiable with
+    respect to both `boxes` and `sigma`.
+    """
+    def __init__(
+        self, 
+        dim, 
+        n_heads, 
+        k_dim: Optional[int] = None,
+        implementation: str = "cuda",
+        normalize: bool = False,
+        learned_scale: bool = False,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.k_dim = k_dim if k_dim is not None else self.dim
+        self.n_heads = n_heads
+        self.implementation = implementation
+        assert implementation in ["python", "cuda"]
+
+        self.q_weight_generator = torch.nn.Linear(self.dim, n_heads*4) # 2 for offset, 2 for sigma
+        self.k_weight_generator = torch.nn.Linear(self.k_dim, n_heads*4) # 2 for offset, 2 for sigma
+
+        self.normalize = normalize
+        if self.normalize:
+            self.q_offset_norm = torch.nn.LayerNorm(n_heads*2)
+            self.q_sigma_norm = torch.nn.LayerNorm(n_heads*2)
+            self.k_offset_norm = torch.nn.LayerNorm(n_heads*2)
+            self.k_sigma_norm = torch.nn.LayerNorm(n_heads*2)
+
+        self.learned_scale = learned_scale
+        if self.learned_scale:
+            self.scales = torch.nn.Linear(self.dim, n_heads)
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        # Normal initialization of weights with low gain so that it has lower effect.
+        torch.nn.init.xavier_uniform_(self.q_weight_generator.weight, gain=0.1)
+        torch.nn.init.xavier_uniform_(self.k_weight_generator.weight, gain=0.1)
+        # Initialization of offsets and sigmas so that they are roughly centered.
+        q_offsets = self.q_weight_generator.bias[:self.n_heads*2]
+        q_sigmas = self.q_weight_generator.bias[self.n_heads*2:]
+        torch.nn.init.normal_(q_offsets, mean=0.0, std=0.1)
+        torch.nn.init.normal_(q_sigmas, mean=1.0, std=0.1)
+        k_offsets = self.k_weight_generator.bias[:self.n_heads*2]
+        k_sigmas = self.k_weight_generator.bias[self.n_heads*2:]
+        torch.nn.init.normal_(k_offsets, mean=0.0, std=0.1)
+        torch.nn.init.normal_(k_sigmas, mean=1.0, std=0.1)
+
+    def forward(
+        self,
+        pos_queries: torch.Tensor, # (...,N1,4) [x,y,w,h]
+        pos_keys: torch.Tensor, # (...,N2,4) [x,y,w,h]
+        queries: torch.Tensor, # (...,N1,C)
+        keys: torch.Tensor, # (...,N2,C)
+        implementation: str = "cuda"
+    ) -> torch.Tensor: # (B,Nheads,N1,N2)
+        N1,N2 = pos_queries.shape[-2], pos_keys.shape[-2]
+
+        pos_queries, pos_ps = pack([pos_queries], "* n1 xywh")
+        queries, _ = pack([queries], "* n1 c")
+
+        pos_keys, _ = pack([pos_keys], "* n2 xywh")
+        keys, _ = pack([keys], "* n1 c")
+
+        implementation_to_use = self.implementation if implementation is None else implementation
+
+        q_weights = self.q_weight_generator(queries) # (B, N1, Nheads*4)
+        q_offsets = q_weights[:, :, :self.n_heads*2].view(-1,N1,self.n_heads,2) # (B,N1,Nheads,[offset_x, offset_y])
+        q_sigmas = q_weights[:, :, self.n_heads*2:].view(-1,N1,self.n_heads,2) # (B.N1,Nheads,[sigma_x, sigma_y])
+
+        k_weights = self.k_weight_generator(keys) # (B,N2,Nheads*4)
+        k_offsets = k_weights[:, :, :self.n_heads*2].view(-1,N2,self.n_heads,2) # (B,N1,Nheads,[offset_x, offset_y])
+        k_sigmas = k_weights[:, :, self.n_heads*2:].view(-1,N2,self.n_heads,2) # (B.N1,Nheads,[sigma_x, sigma_y])
+
+        # Normalize offsets and sigmas
+        if self.normalize:
+            q_offsets = self.q_offset_norm(q_offsets.view(-1, self.n_heads*2)).view_as(q_offsets)
+            q_sigmas = self.q_sigma_norm(q_sigmas.view(-1, self.n_heads*2)).view_as(q_sigmas) + 1.0
+            k_offsets = self.k_offset_norm(k_offsets.view(-1, self.n_heads*2)).view_as(k_offsets)
+            k_sigmas = self.k_sigma_norm(k_sigmas.view(-1, self.n_heads*2)).view_as(k_sigmas) + 1.0
+
+        #Transpose dimensions
+        q_offsets = q_offsets.transpose(1,2).flatten(0,1) # (B*Nheads,N1,[offset_x, offset_y])
+        q_sigmas = q_sigmas.transpose(1,2).flatten(0,1) # (B*Nheads,N1,[sigma_x, sigma_y])
+
+        k_offsets = k_offsets.transpose(1,2).flatten(0,1) # (B*Nheads,N1,[offset_x, offset_y])
+        k_sigmas = k_sigmas.transpose(1,2).flatten(0,1) # (B*Nheads,N1,[sigma_x, sigma_y])
+
+        # Limit for stability
+        q_offsets = q_offsets.clamp(-5.0, 5.0)
+        q_sigmas = q_sigmas.clamp(0.1, 10.0)
+        k_offsets = k_offsets.clamp(-5.0, 5.0)
+        k_sigmas = k_sigmas.clamp(0.1, 10.0)
+
+        # Expand queries and keys
+        pos_queries = pos_queries[:,None].expand(-1,self.n_heads,-1,-1).flatten(0,1) # (B*Nheads,N1,C)
+        pos_keys = pos_keys[:,None].expand(-1,self.n_heads,-1,-1).flatten(0,1) # (B*Nheads,N1,C)
+
+        if implementation_to_use == "cuda":
+            output = BoxPairGaussianCUDAFunction.apply(
+                pos_queries, q_offsets, q_sigmas, 
+                pos_keys, k_offsets, k_sigmas
+            ) # (B*Nheads,N1,N2)
+        elif implementation_to_use == "python":
+            output = box_pair_gaussian_python(
+                pos_queries, q_offsets, q_sigmas, 
+                pos_keys, k_offsets, k_sigmas
+            ) # (B*Nheads,N1,N2)
+
+        # Scale each head by learned factor.
+        if self.learned_scale:
+            scales = self.scales(queries).transpose(0,2).flatten(0,1).view(-1,N1,1) # (B*Nheads,N1,1)
+            output = output * scales
+
+        final_shape = pos_ps[0] + (self.n_heads, N1, N2)
         return output.view(final_shape)
 
 
@@ -594,6 +719,260 @@ class PosGaussianAttention(torch.nn.Module):
 
             # Add positional bias
             pos_bias = self.pos_mlp_bias(pos, (H, W), queries).transpose(1,2) # (B, n_heads, Q, H, W)
+            attention_logits = attention_logits + pos_bias # (B, n_heads, Q, H, W)
+
+        # Apply attention mask if provided
+        if attn_mask is not None:
+            attn_mask = attn_mask.view(batch_size, self.n_heads, n_queries, H, W)
+            attention_logits = attention_logits.masked_fill(attn_mask, float('-inf'))
+
+        # Flatten back for softmax
+        attention_logits = attention_logits.view(batch_size, self.n_heads, n_queries, H * W)
+
+        # Apply softmax
+        attention_weights = F.softmax(attention_logits, dim=-1)
+
+        # Apply attention to values
+        output = torch.matmul(attention_weights, V)  # (B, n_heads, Q, head_dim)
+
+        # Reshape and concatenate heads
+        output = output.transpose(1, 2).contiguous().view(batch_size, n_queries, self.dim)
+
+        # Final linear projection
+        output = self.out_proj(output) # (B, Q, dim)
+
+        # Unpack to original shape
+        output, = unpack(output, queries_ps, "* q c")
+
+        if return_attn_logits:
+            attn_logits_shape = queries_ps[0] + (self.n_heads, n_queries, H * W)
+            return output, attention_logits.view(attn_logits_shape)
+        else:
+            return output, None
+    
+    def forward_pre(
+        self,
+        queries: torch.Tensor, # (..., Q, C)
+        memory: torch.Tensor, # (..., H, W, k_dim)
+        pos: torch.Tensor, # (..., Q, [x, y, w, h])
+        query_pos_emb: Optional[torch.Tensor] = None, # (..., Q, C)
+        memory_pos_emb: Optional[torch.Tensor] = None, # (..., H, W, k_dim)
+        attn_mask: Optional[torch.Tensor] = None, # (..., Q, H*W)
+        return_attn_logits: bool = False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: # (..., Q, C)
+        # Normalize queries
+        queries = self.norm(queries)
+        # Apply attention to the residual stream.
+        attention, logits = self.forward_inner(
+            queries, memory, pos, query_pos_emb, memory_pos_emb, attn_mask, return_attn_logits
+        )
+        queries = queries + self.dropout(attention)
+        return queries, logits
+    
+    def forward_post(
+        self,
+        queries: torch.Tensor, # (..., Q, C)
+        memory: torch.Tensor, # (..., H, W, k_dim)
+        pos: torch.Tensor, # (..., Q, [x, y, w, h])
+        query_pos_emb: Optional[torch.Tensor] = None, # (..., Q, C)
+        memory_pos_emb: Optional[torch.Tensor] = None, # (..., H, W, k_dim)
+        attn_mask: Optional[torch.Tensor] = None, # (..., Q, H*W)
+        return_attn_logits: bool = False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: # (..., Q, C)
+        # Apply attention to the residual stream.
+        attention, logits = self.forward_inner(
+            queries, memory, pos, query_pos_emb, memory_pos_emb, attn_mask, return_attn_logits
+        )
+        queries = queries + self.dropout(attention)
+        # Normalize queries
+        queries = self.norm(queries)
+        return queries, logits
+
+    def forward(
+        self,
+        queries: torch.Tensor, # (..., Q, C)
+        memory: torch.Tensor, # (..., H, W, k_dim)
+        pos: torch.Tensor, # (..., Q, [x, y, w, h])
+        query_pos_emb: Optional[torch.Tensor] = None, # (..., Q, C)
+        memory_pos_emb: Optional[torch.Tensor] = None, # (..., H, W, k_dim)
+        attn_mask: Optional[torch.Tensor] = None, # (..., Q, H*W)
+        return_attn_logits: bool = False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: # (..., Q, C)
+        if self.normalize_before:
+            return self.forward_pre(queries, memory, pos, query_pos_emb, memory_pos_emb, attn_mask, return_attn_logits)
+        else:
+            return self.forward_post(queries, memory, pos, query_pos_emb, memory_pos_emb, attn_mask, return_attn_logits)
+
+
+class PosPairGaussianAttention(torch.nn.Module):
+    """
+    Cross-attention module with a positional bias generated by PosGaussian.
+    A query attends to a 2D feature map (memory).
+    """
+    def __init__(
+        self,
+        dim: int,
+        k_dim: Optional[int] = None,
+        n_heads: int = 8,
+        normalize: bool = False,
+        learned_scale: bool = False,
+        normalize_before: bool = False,
+        only_gaussian_logits: bool = False,
+        dropout: float = 0.0,
+        implementation: str = "cuda"
+    ):
+        super().__init__()
+        self.dim = dim
+        self.k_dim = k_dim if k_dim is not None else dim
+        self.n_heads = n_heads
+        self.head_dim = dim // n_heads
+        assert dim % n_heads == 0, f"dim ({dim}) must be divisible by n_heads ({n_heads})"
+
+        self.pos_mlp_bias = PosPairGaussian(dim, n_heads, k_dim, implementation, normalize=normalize, learned_scale=learned_scale)
+
+        # Linear projections for Q, K, V
+        self.only_gaussian_logits = only_gaussian_logits
+        if self.only_gaussian_logits:
+            self.v_proj = torch.nn.Linear(self.k_dim, dim, bias=False)
+        else:
+            self.q_proj = torch.nn.Linear(dim, dim, bias=False)
+            self.kv_proj = torch.nn.Linear(self.k_dim, dim * 2, bias=False)
+
+        self.out_proj = torch.nn.Linear(dim, dim, bias=False)
+
+        self.scale = self.head_dim ** -0.5
+
+        self.norm = torch.nn.LayerNorm(dim)
+        self.dropout = torch.nn.Dropout(dropout)
+
+        self.normalize_before = normalize_before
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                torch.nn.init.xavier_uniform_(p)
+    
+    def with_pos_embed(self, tensor: torch.Tensor, pos: Optional[torch.Tensor]):
+            return tensor if pos is None else tensor + pos
+
+    def generate_center_boxes(self, tensor):
+        B, H, W, C = tensor.shape
+        device = tensor.device
+        
+        # Create normalized center coordinates on the same device
+        y_centers = (torch.arange(H, dtype=torch.float32, device=device) + 0.5) / H
+        x_centers = (torch.arange(W, dtype=torch.float32, device=device) + 0.5) / W
+        
+        # Create meshgrid for all positions
+        y_grid, x_grid = torch.meshgrid(y_centers, x_centers, indexing='ij')
+        
+        # Flatten the grids
+        x_flat = x_grid.flatten()
+        y_flat = y_grid.flatten()
+        
+        # Box dimensions
+        box_width = 1.0 / W
+        box_height = 1.0 / H
+        
+        # Create the box tensor
+        boxes = torch.stack([
+            x_flat,
+            y_flat,
+            torch.full_like(x_flat, box_width),
+            torch.full_like(y_flat, box_height)
+        ], dim=1)
+        
+        # Expand for batch dimension
+        boxes = boxes.unsqueeze(0).expand(B, -1, -1)
+        
+        return boxes
+
+    def forward_inner(
+        self,
+        queries: torch.Tensor, # (..., Q, C)
+        memory: torch.Tensor, # (..., H, W, k_dim)
+        pos: torch.Tensor, # (..., Q, [x, y, w, h])
+        query_pos_emb: Optional[torch.Tensor] = None, # (..., Q, C)
+        memory_pos_emb: Optional[torch.Tensor] = None, # (..., H, W, k_dim)
+        attn_mask: Optional[torch.Tensor] = None, # (..., Q, H*W)
+        return_attn_logits: bool = False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]: # (..., Q, C)
+        """
+        Inner forward pass for PosMLPAttention.
+
+        Args:
+            queries: The query tensor.
+            memory: The key/value source tensor (a 2D feature map).
+            pos: The positional information corresponding to the queries.
+            query_pos_emb: Optional positional embeddings for the queries.
+            memory_pos_emb: Optional positional embeddings for the memory.
+            attn_mask: Optional attention mask.
+
+        Returns:
+            The output tensor after attention.
+        """
+        # Add positional embeddings if provided
+        queries = self.with_pos_embed(queries, query_pos_emb)
+        memory = self.with_pos_embed(memory, memory_pos_emb)
+
+        # Flatten batch dimensions
+        queries, queries_ps = pack([queries], "* q c")
+        memory, _ = pack([memory], "* h w c")
+        pos, _ = pack([pos], "* q xywh")
+
+        assert (memory.shape[-1] == self.k_dim), (
+            f"Memory feature dimension ({memory.shape[-1]}) must match k_dim ({self.k_dim})"
+        )
+        assert (queries.shape[0] == pos.shape[0]), (
+            f"Batch size of queries ({queries.shape[0]}) must match batch size of pos ({pos.shape[0]})"
+        )
+
+        batch_size = queries.shape[0]
+        H, W = memory.shape[1], memory.shape[2]
+        n_queries = queries.shape[1]
+
+        # Generate boxes for the HW embeddings.
+        pos_memory = self.generate_center_boxes(memory) # (B,H*W,[x,y,w,h])
+
+        # Flatten spatial dimensions of memory
+        memory_flat = memory.view(batch_size, H * W, -1)  # (B, H*W, k_dim)
+
+        # Compute Q, K, V
+        if self.only_gaussian_logits:
+            V = self.v_proj(memory_flat)  # (B, H*W, dim)
+            V = V.view(batch_size, H * W, self.n_heads, self.head_dim)
+            V = V.transpose(1, 2)  # (B, n_heads, H*W, head_dim)
+
+            attention_logits = self.pos_mlp_bias(
+                pos, pos_memory, 
+                queries, memory_flat
+            ) # (B, n_heads, Q, H*W)
+        else:
+            Q = self.q_proj(queries)  # (B, Q, dim)
+            K, V = self.kv_proj(memory_flat).chunk(2, dim=-1)  # Each: (B, H*W, dim)
+
+            # Reshape for multi-head attention
+            Q = Q.view(batch_size, n_queries, self.n_heads, self.head_dim)
+            K = K.view(batch_size, H * W, self.n_heads, self.head_dim)
+            V = V.view(batch_size, H * W, self.n_heads, self.head_dim)
+
+            # Transpose for attention computation
+            Q = Q.transpose(1, 2)  # (B, n_heads, Q, head_dim)
+            K = K.transpose(1, 2)  # (B, n_heads, H*W, head_dim)
+            V = V.transpose(1, 2)  # (B, n_heads, H*W, head_dim)
+
+            # Compute attention scores
+            attention_logits = torch.matmul(Q, K.transpose(-2, -1)) * self.scale  # (B, n_heads, Q, H*W)
+
+            # Reshape attention logits to (B, n_heads, Q, H, W) for adding positional bias
+            attention_logits = attention_logits.view(batch_size, self.n_heads, n_queries, H, W)
+
+            # Add positional bias
+            pos_bias = self.pos_mlp_bias(
+                pos, pos_memory, 
+                queries, memory_flat
+            ).view(-1,self.n_heads,n_queries,H,W) # (B, n_heads, Q, H*W)
             attention_logits = attention_logits + pos_bias # (B, n_heads, Q, H, W)
 
         # Apply attention mask if provided

@@ -312,18 +312,18 @@ def test_box_pair_brbp():
     tester.run(Ch=Ch)
 
 def test_box_pair_gaussian():
-    B, N1, N2 = 16*8, 300, 300
+    B, N1, N2 = 16*8, 300, 64*64
 
     input_creators = {
         "boxes1": lambda device, dtype: torch.cat([
-            torch.rand(B, 2, device=device, dtype=dtype),
-            torch.rand(B, 2, device=device, dtype=dtype) * 0.5 + 0.1
+            torch.rand(B, N1, 2, device=device, dtype=dtype),
+            torch.rand(B, N1, 2, device=device, dtype=dtype) * 0.5 + 0.1
         ], dim=-1),
         "offset1": lambda device, dtype: (torch.rand(B, N1, 2, device=device, dtype=dtype) - 0.5) * 0.2,
         "sigma1": lambda device, dtype: torch.rand(B, N1, 2, device=device, dtype=dtype) * 0.5 + 0.1,
         "boxes2": lambda device, dtype: torch.cat([
-            torch.rand(B, 2, device=device, dtype=dtype),
-            torch.rand(B, 2, device=device, dtype=dtype) * 0.5 + 0.1
+            torch.rand(B, N2, 2, device=device, dtype=dtype),
+            torch.rand(B, N2, 2, device=device, dtype=dtype) * 0.5 + 0.1
         ], dim=-1),
         "offset2": lambda device, dtype: (torch.rand(B, N2, 2, device=device, dtype=dtype) - 0.5) * 0.2,
         "sigma2": lambda device, dtype: torch.rand(B, N2, 2, device=device, dtype=dtype) * 0.5 + 0.1,
@@ -339,7 +339,7 @@ def test_box_pair_gaussian():
     tester.run()
 
 def test_attention():
-    B, Nh, Nq, Nk, C = 16, 8, 300, 300, 32
+    B, Nh, Nq, Nk, C = 16, 8, 300, 64*64, 32
 
     input_creators = {
         "q": lambda device, dtype: torch.randn(B, Nh, Nq, C, device=device, dtype=dtype),
@@ -358,7 +358,7 @@ def test_attention():
 
 
 if __name__ == "__main__":
-    #test_attention()
+    #test_attention() # QK is 5ms + 26ms
     #test_box_rbp()
     #test_box_brbp()
     #test_box_pair_rbp()

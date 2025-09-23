@@ -51,40 +51,40 @@ def box_pair_gaussian_python(
     derived from bounding boxes with offsets and sigmas.
     
     Args:
-        boxes1 (torch.Tensor): A tensor of shape (B, 4) containing the normalized
-            bounding box coordinates [x, y, w, h] for the first set.
+        boxes1 (torch.Tensor): A tensor of shape (B, N, 4) containing the normalized
+                              bounding box coordinates [x, y, w, h] for the first set.
         offset1 (torch.Tensor): A tensor of shape (B, N, 2) containing the relative
-            offsets [offset_x, offset_y] for the first set.
+                               offsets [offset_x, offset_y] for the first set.
         sigma1 (torch.Tensor): A tensor of shape (B, N, 2) containing the relative
-            standard deviations [sigma_x, sigma_y] for the first set.
-        boxes2 (torch.Tensor): A tensor of shape (B, 4) containing the normalized
-            bounding box coordinates [x, y, w, h] for the second set.
+                              standard deviations [sigma_x, sigma_y] for the first set.
+        boxes2 (torch.Tensor): A tensor of shape (B, M, 4) containing the normalized
+                              bounding box coordinates [x, y, w, h] for the second set.
         offset2 (torch.Tensor): A tensor of shape (B, M, 2) containing the relative
-            offsets [offset_x, offset_y] for the second set.
+                               offsets [offset_x, offset_y] for the second set.
         sigma2 (torch.Tensor): A tensor of shape (B, M, 2) containing the relative
-            standard deviations [sigma_x, sigma_y] for the second set.
+                              standard deviations [sigma_x, sigma_y] for the second set.
     
     Returns:
         torch.Tensor: A tensor of shape (B, N, M) containing pairwise Bhattacharyya
-            coefficients between all pairs of Gaussians.
-    """    
+                     coefficients between all pairs of Gaussians.
+    """
     # Extract box centers and sizes for both sets
-    centers1 = boxes1[:, :2]  # Shape: (B, 2)
-    sizes1 = boxes1[:, 2:]    # Shape: (B, 2)
+    centers1 = boxes1[:, :, :2]  # Shape: (B, N, 2)
+    sizes1 = boxes1[:, :, 2:]    # Shape: (B, N, 2)
     half_sizes1 = sizes1 / 2.0
     
-    centers2 = boxes2[:, :2]  # Shape: (B, 2)
-    sizes2 = boxes2[:, 2:]    # Shape: (B, 2)
+    centers2 = boxes2[:, :, :2]  # Shape: (B, M, 2)
+    sizes2 = boxes2[:, :, 2:]    # Shape: (B, M, 2)
     half_sizes2 = sizes2 / 2.0
     
     # Calculate effective centers and sigmas for both sets
-    # For set 1: expand to (B, N, 2)
-    effective_centers1 = centers1.unsqueeze(1) + offset1 * half_sizes1.unsqueeze(1)
-    effective_sigmas1 = sigma1 * half_sizes1.unsqueeze(1)
+    # For set 1: already (B, N, 2)
+    effective_centers1 = centers1 + offset1 * half_sizes1
+    effective_sigmas1 = sigma1 * half_sizes1
     
-    # For set 2: expand to (B, M, 2)
-    effective_centers2 = centers2.unsqueeze(1) + offset2 * half_sizes2.unsqueeze(1)
-    effective_sigmas2 = sigma2 * half_sizes2.unsqueeze(1)
+    # For set 2: already (B, M, 2)
+    effective_centers2 = centers2 + offset2 * half_sizes2
+    effective_sigmas2 = sigma2 * half_sizes2
     
     # Add epsilon for numerical stability
     epsilon = 1e-6
